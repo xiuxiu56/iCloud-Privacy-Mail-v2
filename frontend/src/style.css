@@ -2763,9 +2763,9 @@ textarea.field {
 }
 
 .public-code-message-list {
-  height: auto;
+  height: 466px;
   max-height: 466px;
-  min-height: 52px;
+  min-height: 466px;
 }
 
 .public-code-message-list .mail-message-row {
