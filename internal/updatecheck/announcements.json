@@ -1,13 +1,22 @@
 {
   "schema_version": 1,
   "latest": {
-    "version": "2.2.1",
-    "name": "2.2.1 源码版",
-    "notes": "修复公共取码页的邮箱类型识别和表单对齐，域名邮箱现在按系统中已启用的接收域名精确判断。请重新下载最新源代码，并按照 README 重新构建和启动。",
-    "published_at": "2026-08-30T20:05:00+08:00",
+    "version": "2.2.2",
+    "name": "2.2.2 源码版",
+    "notes": "Server 酱通知新增中国时间当日序号，显示“第 N 次通知”，每天 00:00 自动重置且服务重启后延续计数。请重新下载最新源代码，并按照 README 重新构建和启动。",
+    "published_at": "2026-08-30T21:40:00+08:00",
     "url": "https://github.com/xiuxiu56/iCloud-Privacy-Mail-v2/archive/refs/heads/main.zip"
   },
   "announcements": [
+    {
+      "id": "source-version-2-2-2",
+      "type": "update",
+      "title": "2.2.2 通知次数显示已更新",
+      "summary": "Server 酱通知改为显示当日第几次，不设置本地总数上限。",
+      "content": "Server 酱消息摘要和详情新增“第 N 次通知”。序号按中国标准时间的自然日累计，每天 00:00 自动从第 1 次重新开始；当日服务重启时从 SQLite 恢复已有序号。该序号只用于展示，项目本地不限制通知条数；Server 酱免费通道显示的 [N/5] 是平台当日额度标记。",
+      "published_at": "2026-08-30T21:40:00+08:00",
+      "url": "https://github.com/xiuxiu56/iCloud-Privacy-Mail-v2/archive/refs/heads/main.zip"
+    },
     {
       "id": "source-version-2-2-1",
       "type": "update",

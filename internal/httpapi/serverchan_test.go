@@ -102,7 +102,7 @@ func TestServerChanTestUsesStoredKeyAndOptions(t *testing.T) {
 		t.Fatalf("测试推送失败：%d %s", recorder.Code, recorder.Body.String())
 	}
 	call := <-fake.calls
-	if call.Options.SendKey != settings.ServerChanSendKey || !call.Options.HideIP || !strings.Contains(call.Message.Title, "测试") {
+	if call.Options.SendKey != settings.ServerChanSendKey || !call.Options.HideIP || !strings.Contains(call.Message.Title, "测试") || !strings.HasPrefix(call.Message.Short, "第1次通知｜") || !strings.Contains(call.Message.Desp, "通知序号：第1次通知") {
 		t.Fatalf("测试推送参数不正确：%+v", call)
 	}
 }
@@ -146,7 +146,7 @@ func TestAdminLoginAndOfflineTransitionsSendNotifications(t *testing.T) {
 	request.Header.Set("User-Agent", "测试浏览器")
 	server.notifyAdminLogin(request, domain.Admin{Username: "admin"})
 	loginCall := waitForServerChanCall(t, fake.calls)
-	if !strings.Contains(loginCall.Message.Title, "登录") || !strings.Contains(loginCall.Message.Desp, "127.0.0.1") || !strings.Contains(loginCall.Message.Desp, "测试浏览器") {
+	if !strings.Contains(loginCall.Message.Title, "登录") || !strings.HasPrefix(loginCall.Message.Short, "第1次通知｜") || !strings.Contains(loginCall.Message.Desp, "127.0.0.1") || !strings.Contains(loginCall.Message.Desp, "测试浏览器") {
 		t.Fatalf("登录通知不正确：%+v", loginCall.Message)
 	}
 
@@ -157,7 +157,7 @@ func TestAdminLoginAndOfflineTransitionsSendNotifications(t *testing.T) {
 		[]domain.ICloudSession{{AccountID: "acc-1", AppleID: "notify@example.com"}},
 	)
 	offlineCall := waitForServerChanCall(t, fake.calls)
-	if offlineCall.Message.Title != "notify@example.com｜Apple 登录态掉线" || strings.Contains(offlineCall.Message.Title, "/") || !strings.Contains(offlineCall.Message.Desp, "掉线账号：notify@example.com") || !strings.Contains(offlineCall.Message.Desp, "IMAP 取码") {
+	if offlineCall.Message.Title != "notify@example.com｜Apple 登录态掉线" || strings.Contains(offlineCall.Message.Title, "/") || !strings.HasPrefix(offlineCall.Message.Short, "第2次通知｜") || !strings.Contains(offlineCall.Message.Desp, "掉线账号：notify@example.com") || !strings.Contains(offlineCall.Message.Desp, "IMAP 取码") {
 		t.Fatalf("掉线通知不正确：%+v", offlineCall.Message)
 	}
 }
@@ -189,7 +189,7 @@ func TestOfflineTransitionsMergeMultipleAccountsWithoutTotalCount(t *testing.T) 
 	)
 
 	call := waitForServerChanCall(t, fake.calls)
-	if call.Options.SendKey != "SCT-paid-or-free-key" || strings.Contains(call.Message.Title, "/") || !strings.Contains(call.Message.Title, "first@example.com") || !strings.Contains(call.Message.Desp, "掉线账号：first@example.com") || !strings.Contains(call.Message.Desp, "掉线账号：second@example.com") {
+	if call.Options.SendKey != "SCT-paid-or-free-key" || strings.Contains(call.Message.Title, "/") || !strings.HasPrefix(call.Message.Short, "第1次通知｜") || !strings.Contains(call.Message.Title, "first@example.com") || !strings.Contains(call.Message.Desp, "掉线账号：first@example.com") || !strings.Contains(call.Message.Desp, "掉线账号：second@example.com") {
 		t.Fatalf("多账号掉线合并通知不正确：%+v", call)
 	}
 	select {

@@ -106,10 +106,10 @@ data/app.db.key
 {
   "schema_version": 1,
   "latest": {
-    "version": "2.2.1",
-    "name": "2.2.1 源码版",
-    "notes": "修复公共取码页邮箱类型识别与表单对齐，请重新下载最新源代码并按文档重新构建",
-    "published_at": "2026-08-30T20:05:00+08:00",
+    "version": "2.2.2",
+    "name": "2.2.2 源码版",
+    "notes": "Server 酱通知新增中国时间当日序号，每天 00:00 重置",
+    "published_at": "2026-08-30T21:40:00+08:00",
     "url": "https://github.com/xiuxiu56/iCloud-Privacy-Mail-v2/archive/refs/heads/main.zip"
   },
   "announcements": []

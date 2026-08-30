@@ -50,11 +50,12 @@ func (s *Server) handleServerChanTest(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
-	result, err := s.serverChan.Send(ctx, serverChanOptions(settings), serverchan.Message{
+	message := s.numberServerChanMessage(serverchan.Message{
 		Title: "iCloud Privacy Mail 测试通知",
 		Desp:  fmt.Sprintf("这是一条 Server 酱配置测试消息。\n\n- 发送时间：%s\n- 结果：后端已成功提交推送任务", time.Now().Format("2006-01-02 15:04:05")),
 		Short: "Server 酱配置测试成功",
 	})
+	result, err := s.serverChan.Send(ctx, serverChanOptions(settings), message)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "server_chan_test_failed", err.Error())
 		return
@@ -88,6 +89,7 @@ func (s *Server) sendServerChanAsync(settings domain.Settings, message servercha
 	if sender == nil {
 		return
 	}
+	message = s.numberServerChanMessage(message)
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
@@ -99,6 +101,18 @@ func (s *Server) sendServerChanAsync(settings domain.Settings, message servercha
 		s.log.Info("Server 酱推送已入队", "标题", message.Title)
 		_ = s.store.RecordEvent("info", "notification", "Server 酱推送已入队："+message.Title)
 	}()
+}
+
+func (s *Server) numberServerChanMessage(message serverchan.Message) serverchan.Message {
+	sequence, err := s.store.NextDailyServerChanNotificationSequence(time.Now())
+	if err != nil {
+		s.log.Warn("Server 酱通知序号生成失败", "错误", err)
+		return message
+	}
+	sequenceLabel := fmt.Sprintf("第%d次通知", sequence)
+	message.Short = sequenceLabel + "｜" + firstNonEmptyText(message.Short, message.Title)
+	message.Desp = fmt.Sprintf("- 通知序号：%s\n\n%s", sequenceLabel, strings.TrimSpace(message.Desp))
+	return message
 }
 
 func (s *Server) startAccountLoginStateNotifications(ctx context.Context) {
