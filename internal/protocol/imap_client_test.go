@@ -39,6 +39,15 @@ func TestParseICloudIMAPMessageKeepsHTMLAndPlainText(t *testing.T) {
 	}
 }
 
+func TestMatchingDiscoveredEmailsOnlyAcceptsConfiguredDomains(t *testing.T) {
+	recipients := `To: "域名邮箱" <MRHUANG1@xiummm.com>, receiver@icloud.com
+Delivered-To: random@other.example`
+	items := matchingDiscoveredEmails(recipients, []string{"xiummm.com"}, map[string]string{"known": "known@xiummm.com"})
+	if len(items) != 1 || items[0] != "mrhuang1@xiummm.com" {
+		t.Fatalf("自动发现收件人结果不正确：%v", items)
+	}
+}
+
 func TestIMAPSearchUsesAccountCursorBeforeMailboxCursor(t *testing.T) {
 	mailboxes := []Mailbox{{ID: "mailbox-1", LastSyncUID: "900"}}
 	command, incremental := imapSearchCommand("42", mailboxes, time.Time{}, true, false)
@@ -68,6 +77,33 @@ func TestIMAPManualSyncSearchesAllBeforeTakingLatestLimit(t *testing.T) {
 	command, incremental := imapSearchCommand("", nil, time.Time{}, false, false)
 	if incremental || command != "UID SEARCH ALL" {
 		t.Fatalf("手动同步应搜索整个收件箱再截取最新邮件：%q，incremental=%t", command, incremental)
+	}
+}
+
+func TestIMAPFullScanIsBoundedAtSelectedSnapshot(t *testing.T) {
+	command, incremental := imapSearchCommand("", nil, time.Time{}, false, false, 1211)
+	if incremental || command != "UID SEARCH UID 1:1211" {
+		t.Fatalf("全量扫描应固定在 SELECT 时的最高 UID：%q，incremental=%t", command, incremental)
+	}
+}
+
+func TestParseICloudIMAPHeaderIndexesForwardRecipient(t *testing.T) {
+	raw := strings.Join([]string{
+		"From: Sender <sender@example.com>",
+		"To: receiver@icloud.com",
+		"X-Original-To: MRHUANG1@xiummm.com",
+		"Message-ID: <history@example.com>",
+		"Subject: 历史邮件",
+		"Date: Fri, 28 Aug 2026 12:00:00 +0800",
+		"",
+		"",
+	}, "\r\n")
+	entry, recipients, ok := parseICloudIMAPHeader(iCloudIMAPFetchedMessage{UID: "42", Raw: []byte(raw)})
+	if !ok || entry.UID != "42" || entry.CanonicalID != "message-id:history@example.com" {
+		t.Fatalf("邮件头索引解析失败：%+v", entry)
+	}
+	if !strings.Contains(strings.ToLower(recipients), "mrhuang1@xiummm.com") || len(entry.Recipients) != 2 {
+		t.Fatalf("转发收件地址未纳入索引：%q %+v", recipients, entry.Recipients)
 	}
 }
 

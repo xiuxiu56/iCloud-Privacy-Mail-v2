@@ -93,9 +93,8 @@ const mailboxStatusOptions = [
 ]
 const mailboxDetailStatusOptions = [
   { value: 'available', label: '可用', dot: 'bg-emerald-500' },
-  { value: 'reserved', label: '已预留（由租约管理）', dot: 'bg-violet-500', disabled: true },
+  { value: 'reserved', label: '已预留', dot: 'bg-violet-500' },
   { value: 'used', label: '已使用', dot: 'bg-amber-500' },
-  { value: 'active', label: '活跃', dot: 'bg-sky-500' },
   { value: 'failed', label: '失败', dot: 'bg-rose-500' },
   { value: 'disabled', label: '已停用', dot: 'bg-slate-500' },
 ]
@@ -131,7 +130,8 @@ const selectedMessageHTMLDocument = computed(() => buildEmailHTMLDocument(select
 const showSelectedMessageHTML = computed(() => selectedMessageHasHTML.value && messageViewMode.value !== 'text')
 
 function statusLabel(value) {
-  return ({ available: '可用', reserved: '已预留', used: '已使用', failed: '失败', disabled: '已停用', active: '活跃' })[value] || value || '未知'
+  const normalized = value === 'active' ? 'available' : value
+  return ({ available: '可用', reserved: '已预留', used: '已使用', failed: '失败', disabled: '已停用' })[normalized] || normalized || '未知'
 }
 
 function mailboxAppleAccount(mailbox) {
@@ -140,10 +140,11 @@ function mailboxAppleAccount(mailbox) {
 }
 
 function statusClass(value) {
-  if (value === 'available' || value === 'active') return 'bg-emerald-50 text-emerald-600 dark:bg-emerald-950/40 dark:text-emerald-300'
-  if (value === 'reserved') return 'bg-violet-50 text-violet-600 dark:bg-violet-950/40 dark:text-violet-300'
-  if (value === 'failed') return 'bg-rose-50 text-rose-600 dark:bg-rose-950/40 dark:text-rose-300'
-  if (value === 'disabled') return 'bg-slate-100 text-slate-500 dark:bg-slate-700 dark:text-slate-300'
+  const normalized = value === 'active' ? 'available' : value
+  if (normalized === 'available') return 'bg-emerald-50 text-emerald-600 dark:bg-emerald-950/40 dark:text-emerald-300'
+  if (normalized === 'reserved') return 'bg-violet-50 text-violet-600 dark:bg-violet-950/40 dark:text-violet-300'
+  if (normalized === 'failed') return 'bg-rose-50 text-rose-600 dark:bg-rose-950/40 dark:text-rose-300'
+  if (normalized === 'disabled') return 'bg-slate-100 text-slate-500 dark:bg-slate-700 dark:text-slate-300'
   return 'bg-amber-50 text-amber-600 dark:bg-amber-950/40 dark:text-amber-300'
 }
 
@@ -704,7 +705,7 @@ async function refreshMailboxPool() {
     ])
     if (selected.value?.id !== selectedID) return
     const previous = selected.value
-    if (edit.status === previous.status) edit.status = detail.mailbox.status
+    if (edit.status === previous.status || (previous.status === 'active' && edit.status === 'available')) edit.status = detail.mailbox.status === 'active' ? 'available' : detail.mailbox.status
     if (edit.api_active === previous.api_active) edit.api_active = detail.mailbox.api_active
     if (edit.icloud_active === previous.icloud_active) edit.icloud_active = detail.mailbox.icloud_active
     if (edit.note === (previous.note || '')) edit.note = detail.mailbox.note || ''
@@ -897,7 +898,7 @@ async function openMailbox(mailbox) {
     selected.value = detail.mailbox
     messages.value = messageData.items || []
     Object.assign(edit, {
-      status: selected.value.status,
+      status: selected.value.status === 'active' ? 'available' : selected.value.status,
       api_active: selected.value.api_active,
       icloud_active: selected.value.icloud_active,
       note: selected.value.note || '',
@@ -1057,7 +1058,7 @@ async function copyCode() {
 function openQuickEdit(mailbox, field) {
   quickEditMailbox.value = mailbox
   quickEditField.value = field
-  quickEdit.status = mailbox.status || 'available'
+  quickEdit.status = mailbox.status === 'active' ? 'available' : (mailbox.status || 'available')
   quickEdit.note = mailbox.note || ''
   quickEditOpen.value = true
 }

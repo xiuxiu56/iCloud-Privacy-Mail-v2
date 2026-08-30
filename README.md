@@ -126,6 +126,41 @@ data/app.db.key
 
 ![深色模式](./docs/screenshots/08-dark-mode.jpg)
 
+## 外部邮箱 API
+
+在系统设置中开启“公共取号 API”并设置全局 API Key。领取邮箱时可用 `mailbox_kind` 区分来源：
+
+```http
+POST /api/v1/mailboxes/claim
+X-API-Key: YOUR_API_KEY
+Content-Type: application/json
+```
+
+```json
+{
+  "project": "注册任务",
+  "purpose": "创建账号",
+  "request_id": "request-001",
+  "mailbox_kind": "domain_forward",
+  "domain": "xiummm.com",
+  "ttl_seconds": 1800
+}
+```
+
+- `icloud_hme`：只领取 Apple 隐私邮箱。
+- `domain_forward`：只领取域名邮箱，可用 `domain` 指定接收域名。
+- `any` 或留空：领取任意可用邮箱。
+
+取码、邮件列表和完整正文对两类邮箱使用相同接口，后端会根据邮箱记录选择对应收件链路：
+
+```text
+GET /api/v1/mailboxes/{email}/code
+GET /api/v1/mailboxes/{email}/messages
+GET /api/v1/mailboxes/{email}/messages/{message_id}
+```
+
+邮箱独立 API Token、全局 API Key、`X-API-Key` 和 `Authorization: Bearer` 的鉴权方式保持一致。响应中的 `mailbox_kind` 用于确认邮箱来源。
+
 ## 页面
 
 ### 登录
@@ -143,6 +178,10 @@ data/app.db.key
 ### 邮箱池
 
 ![邮箱池](./docs/screenshots/03-mailboxes.jpg)
+
+### 域名邮箱
+
+域名邮箱页面用于生成和登记地址、同步收件、获取验证码、查看完整邮件以及清理本地邮件。
 
 ### 创建隐私邮箱
 
@@ -164,6 +203,7 @@ data/app.db.key
 | `/` | 控制台 |
 | `/apple-accounts` | Apple 账号与登录态 |
 | `/mailboxes` | 邮箱池与邮件取码 |
+| `/domain-mailboxes` | 域名邮箱与邮件取码 |
 | `/tasks` | 隐私邮箱创建任务 |
 | `/settings` | 系统设置、数据库维护与消息推送 |
 | `/email-code` | 公共邮箱取码页面 |

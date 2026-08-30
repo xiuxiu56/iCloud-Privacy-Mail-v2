@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-const SchemaVersion = 5
+const SchemaVersion = 6
 
 const (
 	StatusActive    = "active"
@@ -31,25 +31,36 @@ const (
 	LoginStateICloudWeb    = "icloud_web"
 	LoginStateAppleAccount = "apple_account"
 	LoginStateICloudIMAP   = "icloud_imap"
+
+	MailboxKindICloudHME     = "icloud_hme"
+	MailboxKindDomainForward = "domain_forward"
+
+	DomainReceiverAppleAccount = "apple_account"
+	DomainReceiverCustomIMAP   = "custom_imap"
+
+	DomainMatchCatchAll       = "catch_all"
+	DomainMatchRegisteredOnly = "registered_only"
 )
 
 type State struct {
-	SchemaVersion       int               `json:"schema_version"`
-	NextID              int               `json:"next_id"`
-	Admin               *Admin            `json:"admin,omitempty"`
-	Sessions            []WebSession      `json:"sessions,omitempty"`
-	AppleAccounts       []AppleAccount    `json:"apple_accounts,omitempty"`
-	Mailboxes           []Mailbox         `json:"mailboxes,omitempty"`
-	MailboxLeases       []MailboxLease    `json:"mailbox_leases,omitempty"`
-	Messages            []Message         `json:"messages,omitempty"`
-	Events              []Event           `json:"events,omitempty"`
-	Settings            Settings          `json:"settings"`
-	CreateSettings      CreateSettings    `json:"create_settings"`
-	ICloudSessions      []ICloudSession   `json:"icloud_sessions,omitempty"`
-	LegacyICloudSession json.RawMessage   `json:"legacy_icloud_session,omitempty"`
-	LegacyICloudStates  []json.RawMessage `json:"legacy_icloud_sessions,omitempty"`
-	CreatedAt           time.Time         `json:"created_at"`
-	UpdatedAt           time.Time         `json:"updated_at"`
+	SchemaVersion       int                `json:"schema_version"`
+	NextID              int                `json:"next_id"`
+	Admin               *Admin             `json:"admin,omitempty"`
+	Sessions            []WebSession       `json:"sessions,omitempty"`
+	AppleAccounts       []AppleAccount     `json:"apple_accounts,omitempty"`
+	Mailboxes           []Mailbox          `json:"mailboxes,omitempty"`
+	DomainMailRoutes    []DomainMailRoute  `json:"domain_mail_routes,omitempty"`
+	DomainMailSettings  DomainMailSettings `json:"domain_mail_settings"`
+	MailboxLeases       []MailboxLease     `json:"mailbox_leases,omitempty"`
+	Messages            []Message          `json:"messages,omitempty"`
+	Events              []Event            `json:"events,omitempty"`
+	Settings            Settings           `json:"settings"`
+	CreateSettings      CreateSettings     `json:"create_settings"`
+	ICloudSessions      []ICloudSession    `json:"icloud_sessions,omitempty"`
+	LegacyICloudSession json.RawMessage    `json:"legacy_icloud_session,omitempty"`
+	LegacyICloudStates  []json.RawMessage  `json:"legacy_icloud_sessions,omitempty"`
+	CreatedAt           time.Time          `json:"created_at"`
+	UpdatedAt           time.Time          `json:"updated_at"`
 }
 
 type Admin struct {
@@ -87,6 +98,8 @@ type Mailbox struct {
 	AccountID         string    `json:"account_id,omitempty"`
 	AnonymousID       string    `json:"anonymous_id,omitempty"`
 	RemoteOrigin      string    `json:"remote_origin,omitempty"`
+	MailboxKind       string    `json:"mailbox_kind,omitempty"`
+	DomainRouteID     string    `json:"domain_route_id,omitempty"`
 	Label             string    `json:"label"`
 	Email             string    `json:"email"`
 	ForwardToEmail    string    `json:"forward_to_email,omitempty"`
@@ -103,6 +116,34 @@ type Mailbox struct {
 	LastCodeAt        time.Time `json:"last_code_at,omitempty"`
 	CreatedAt         time.Time `json:"created_at"`
 	UpdatedAt         time.Time `json:"updated_at"`
+}
+
+// DomainMailSettings 保存域名邮箱功能的全局行为；具体收件链路由 DomainMailRoute 描述。
+type DomainMailSettings struct {
+	Enabled          bool      `json:"enabled"`
+	MatchMode        string    `json:"match_mode"`
+	AutoDiscover     bool      `json:"auto_discover"`
+	DefaultAPIActive bool      `json:"default_api_active"`
+	UpdatedAt        time.Time `json:"updated_at,omitempty"`
+}
+
+// DomainMailRoute 把一个接收域名绑定到真正拥有收件箱访问能力的账号或标准 IMAP 登录态。
+type DomainMailRoute struct {
+	ID                     string    `json:"id"`
+	Domain                 string    `json:"domain"`
+	ReceiverType           string    `json:"receiver_type"`
+	AccountID              string    `json:"account_id,omitempty"`
+	ReceiverLabel          string    `json:"receiver_label,omitempty"`
+	ForwardToEmail         string    `json:"forward_to_email"`
+	IMAPHost               string    `json:"imap_host,omitempty"`
+	IMAPPort               int       `json:"imap_port,omitempty"`
+	IMAPUsername           string    `json:"imap_username,omitempty"`
+	IMAPPassword           string    `json:"imap_password,omitempty"`
+	IMAPPasswordConfigured bool      `json:"imap_password_configured,omitempty"`
+	IMAPTLS                bool      `json:"imap_tls"`
+	Enabled                bool      `json:"enabled"`
+	CreatedAt              time.Time `json:"created_at"`
+	UpdatedAt              time.Time `json:"updated_at"`
 }
 
 // MailboxLease 记录外部调用方对邮箱的临时占用，只有提交租约才会把邮箱标记为已使用。
@@ -293,6 +334,14 @@ func DefaultSettings() Settings {
 		EnableWebRemoteMailCleanup: true,
 		AppleAccountModuleReady:    true,
 		ServerChanHideIP:           true,
+	}
+}
+
+func DefaultDomainMailSettings() DomainMailSettings {
+	return DomainMailSettings{
+		MatchMode:        DomainMatchCatchAll,
+		AutoDiscover:     true,
+		DefaultAPIActive: true,
 	}
 }
 

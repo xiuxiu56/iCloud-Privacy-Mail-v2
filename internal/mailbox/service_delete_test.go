@@ -3,6 +3,7 @@ package mailbox
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -21,8 +22,12 @@ type remoteMailboxDeleteClientFixture struct {
 	remoteIDs     []string
 	listCalls     int
 	moveErr       error
+	destroyErr    error
+	discoveryErr  error
+	discoveredIDs map[string][]string
 	emptyTrashErr error
 	onDelete      func()
+	onMove        func()
 }
 
 func (f *remoteMailboxDeleteClientFixture) ListPrivacyMailboxes(context.Context, protocol.ICloudSession) ([]protocol.ICloudRemoteMailbox, error) {
@@ -45,9 +50,28 @@ func (f *remoteMailboxDeleteClientFixture) DeletePrivacyMailbox(_ context.Contex
 	return nil
 }
 
+func (f *remoteMailboxDeleteClientFixture) FindRemoteMessageIDsByMailbox(_ context.Context, _ protocol.ICloudSession, mailboxes []domain.Mailbox) (protocol.ICloudRemoteMessageDiscoveryResult, error) {
+	f.operations = append(f.operations, "扫描远端邮件")
+	if f.discoveryErr != nil {
+		return protocol.ICloudRemoteMessageDiscoveryResult{}, f.discoveryErr
+	}
+	result := protocol.ICloudRemoteMessageDiscoveryResult{RemoteIDsByMailbox: make(map[string][]string), ThreadsScanned: len(mailboxes)}
+	for index, mailbox := range mailboxes {
+		remoteIDs := f.discoveredIDs[mailbox.ID]
+		if f.discoveredIDs == nil {
+			remoteIDs = []string{fmt.Sprintf("icloud:INBOX:%d", 501+index)}
+		}
+		result.RemoteIDsByMailbox[mailbox.ID] = append([]string(nil), remoteIDs...)
+	}
+	return result, nil
+}
+
 func (f *remoteMailboxDeleteClientFixture) MoveRemoteMessagesToTrash(_ context.Context, _ protocol.ICloudSession, remoteIDs []string) (protocol.ICloudMailCleanupResult, error) {
 	f.operations = append(f.operations, "移动远端邮件")
 	f.remoteIDs = append([]string(nil), remoteIDs...)
+	if f.onMove != nil {
+		f.onMove()
+	}
 	if f.moveErr != nil {
 		return protocol.ICloudMailCleanupResult{}, f.moveErr
 	}
@@ -55,6 +79,194 @@ func (f *remoteMailboxDeleteClientFixture) MoveRemoteMessagesToTrash(_ context.C
 		MovedToTrash:   len(remoteIDs),
 		MovedRemoteIDs: append([]string(nil), remoteIDs...),
 	}, nil
+}
+
+func (f *remoteMailboxDeleteClientFixture) MoveRemoteMessagesToTrashAndDestroy(_ context.Context, _ protocol.ICloudSession, remoteIDs []string) (protocol.ICloudMailCleanupResult, error) {
+	f.operations = append(f.operations, "移入废纸篓并彻底删除")
+	f.remoteIDs = append([]string(nil), remoteIDs...)
+	if f.onMove != nil {
+		f.onMove()
+	}
+	result := protocol.ICloudMailCleanupResult{
+		MovedToTrash:   len(remoteIDs),
+		MovedRemoteIDs: append([]string(nil), remoteIDs...),
+	}
+	if f.moveErr != nil {
+		return protocol.ICloudMailCleanupResult{}, f.moveErr
+	}
+	if f.destroyErr != nil {
+		return result, f.destroyErr
+	}
+	result.Destroyed = len(remoteIDs)
+	return result, nil
+}
+
+func TestCleanDomainRemoteMessagesDeletesCloudMailBeforeLocalMail(t *testing.T) {
+	state, mailboxes := newDomainDeleteServiceFixture(t, 2)
+	client := &remoteMailboxDeleteClientFixture{}
+	client.onMove = func() {
+		for _, mailbox := range mailboxes {
+			if len(state.MessagesForMailbox(mailbox.ID)) != 1 {
+				t.Errorf("云端删除完成前本地邮件应保留：%s", mailbox.Email)
+			}
+			if _, found := state.FindMailboxByID(mailbox.ID); !found {
+				t.Errorf("云端删除完成前域名邮箱登记应保留：%s", mailbox.Email)
+			}
+		}
+	}
+	service := NewService(config.Config{}, state)
+	service.deleteClient = client
+	ids := []string{mailboxes[0].ID, mailboxes[1].ID}
+
+	result, err := service.CleanDomainRemoteMessages(context.Background(), ids, true)
+	if err != nil {
+		t.Fatalf("清理域名邮箱邮件失败：%v", err)
+	}
+	if !reflect.DeepEqual(client.operations, []string{"扫描远端邮件", "移入废纸篓并彻底删除"}) {
+		t.Fatalf("域名邮箱只应删除主号邮件，不应删除 iCloud 邮箱对象：%v", client.operations)
+	}
+	if result.CloudMessagesFound != 2 || result.MovedToTrash != 2 || result.Destroyed != 2 || result.LocalRemoved != 2 || result.DeletedMailboxes != 0 {
+		t.Fatalf("域名邮件清理统计不正确：%+v", result)
+	}
+	for _, mailbox := range mailboxes {
+		if len(state.MessagesForMailbox(mailbox.ID)) != 0 {
+			t.Fatalf("云端完成后本地邮件未清理：%s", mailbox.Email)
+		}
+		if _, found := state.FindMailboxByID(mailbox.ID); !found {
+			t.Fatalf("“全部删除邮件”应保留地址登记：%s", mailbox.Email)
+		}
+	}
+}
+
+func TestDeleteDomainMailboxesRemovesLocalRecordsAfterCloudMail(t *testing.T) {
+	state, mailboxes := newDomainDeleteServiceFixture(t, 2)
+	client := &remoteMailboxDeleteClientFixture{}
+	service := NewService(config.Config{}, state)
+	service.deleteClient = client
+
+	result, err := service.DeleteDomainMailboxesWithRemoteMessages(context.Background(), []string{mailboxes[0].ID, mailboxes[1].ID})
+	if err != nil {
+		t.Fatalf("删除域名邮箱失败：%v", err)
+	}
+	if !reflect.DeepEqual(client.operations, []string{"扫描远端邮件", "移入废纸篓并彻底删除"}) || result.MovedToTrash != 2 || result.Destroyed != 2 || result.LocalRemoved != 2 || result.DeletedMailboxes != 2 {
+		t.Fatalf("域名邮箱删除流程不正确：operations=%v result=%+v", client.operations, result)
+	}
+	for _, mailbox := range mailboxes {
+		if _, found := state.FindMailboxByID(mailbox.ID); found {
+			t.Fatalf("云端邮件删除完成后本地地址登记仍存在：%s", mailbox.Email)
+		}
+	}
+}
+
+func TestDeleteDomainMailboxesKeepsLocalDataWhenCloudDeletionFails(t *testing.T) {
+	state, mailboxes := newDomainDeleteServiceFixture(t, 1)
+	client := &remoteMailboxDeleteClientFixture{moveErr: errors.New("云端删除测试失败")}
+	service := NewService(config.Config{}, state)
+	service.deleteClient = client
+
+	_, err := service.DeleteDomainMailboxesWithRemoteMessages(context.Background(), []string{mailboxes[0].ID})
+	if err == nil || !strings.Contains(err.Error(), "云端删除测试失败") {
+		t.Fatalf("未返回云端删除错误：%v", err)
+	}
+	if _, found := state.FindMailboxByID(mailboxes[0].ID); !found || len(state.MessagesForMailbox(mailboxes[0].ID)) != 1 {
+		t.Fatal("云端删除失败时应保留本地邮件和地址登记")
+	}
+}
+
+func TestDeleteDomainMailboxesKeepsLocalDataWhenTrashDestroyFails(t *testing.T) {
+	state, mailboxes := newDomainDeleteServiceFixture(t, 1)
+	client := &remoteMailboxDeleteClientFixture{destroyErr: errors.New("废纸篓彻底删除测试失败")}
+	service := NewService(config.Config{}, state)
+	service.deleteClient = client
+
+	result, err := service.DeleteDomainMailboxesWithRemoteMessages(context.Background(), []string{mailboxes[0].ID})
+	if err == nil || !strings.Contains(err.Error(), "废纸篓彻底删除测试失败") {
+		t.Fatalf("未返回废纸篓彻底删除错误：%v", err)
+	}
+	if result.MovedToTrash != 1 || result.Destroyed != 0 {
+		t.Fatalf("云端删除失败统计不正确：%+v", result)
+	}
+	if _, found := state.FindMailboxByID(mailboxes[0].ID); !found || len(state.MessagesForMailbox(mailboxes[0].ID)) != 1 {
+		t.Fatal("废纸篓彻底删除失败时应保留本地邮件和地址登记")
+	}
+}
+
+func TestDeleteDomainMailboxUsesCloudRecipientScanInsteadOfLocalMessageCache(t *testing.T) {
+	state, mailboxes := newDomainDeleteServiceFixture(t, 1)
+	if _, err := state.DeleteMailboxMessages(mailboxes[0].ID); err != nil {
+		t.Fatalf("清理本地测试邮件失败：%v", err)
+	}
+	client := &remoteMailboxDeleteClientFixture{discoveredIDs: map[string][]string{
+		mailboxes[0].ID: {"icloud:INBOX:909"},
+	}}
+	service := NewService(config.Config{}, state)
+	service.deleteClient = client
+
+	result, err := service.DeleteDomainMailboxesWithRemoteMessages(context.Background(), []string{mailboxes[0].ID})
+	if err != nil {
+		t.Fatalf("删除域名邮箱失败：%v", err)
+	}
+	if !reflect.DeepEqual(client.remoteIDs, []string{"icloud:INBOX:909"}) || result.CloudMessagesFound != 1 || result.MovedToTrash != 1 || result.Destroyed != 1 {
+		t.Fatalf("未按云端收件人扫描结果删除邮件：remoteIDs=%v result=%+v", client.remoteIDs, result)
+	}
+	if _, found := state.FindMailboxByID(mailboxes[0].ID); found {
+		t.Fatal("云端邮件完成后本地域名邮箱登记仍存在")
+	}
+}
+
+func TestDeleteDomainMailboxUsesCompleteIMAPIndexWhenLocalMessagesAreEmpty(t *testing.T) {
+	state, mailboxes := newDomainDeleteServiceFixture(t, 1)
+	mailbox := mailboxes[0]
+	primeDomainDeleteIMAPHistory(t, state, mailbox, true)
+	if _, err := state.DeleteMailboxMessages(mailbox.ID); err != nil {
+		t.Fatalf("清理本地测试邮件失败：%v", err)
+	}
+	backend := &fakeMessageSyncBackend{imapResult: protocol.MailSyncBatchResult{
+		MessagesByMailbox: map[string][]protocol.ICloudSyncedMessage{}, UIDValidity: "delete-validity", LastUID: "101",
+	}}
+	client := &remoteMailboxDeleteClientFixture{}
+	service := NewService(config.Default(), state)
+	service.messageBackend = backend
+	service.deleteClient = client
+
+	result, err := service.DeleteDomainMailboxesWithRemoteMessages(context.Background(), []string{mailbox.ID})
+	if err != nil {
+		t.Fatalf("使用完整 IMAP 索引删除域名邮箱失败：%v", err)
+	}
+	if !reflect.DeepEqual(client.operations, []string{"移入废纸篓并彻底删除"}) ||
+		!reflect.DeepEqual(client.remoteIDs, []string{"imap:101"}) || result.FallbackAccounts != 0 || result.VerifiedMailboxes != 1 {
+		t.Fatalf("本地邮件为空时未使用完整 IMAP 索引：operations=%v remoteIDs=%v result=%+v", client.operations, client.remoteIDs, result)
+	}
+	if _, found := state.FindMailboxByID(mailbox.ID); found {
+		t.Fatal("云端索引邮件删除完成后域名邮箱登记仍存在")
+	}
+}
+
+func TestDeleteDomainMailboxTreatsZeroAsEmptyOnlyAfterIMAPHistoryIsComplete(t *testing.T) {
+	state, mailboxes := newDomainDeleteServiceFixture(t, 1)
+	mailbox := mailboxes[0]
+	primeDomainDeleteIMAPHistory(t, state, mailbox, false)
+	if _, err := state.DeleteMailboxMessages(mailbox.ID); err != nil {
+		t.Fatalf("清理本地测试邮件失败：%v", err)
+	}
+	backend := &fakeMessageSyncBackend{imapResult: protocol.MailSyncBatchResult{
+		MessagesByMailbox: map[string][]protocol.ICloudSyncedMessage{}, UIDValidity: "delete-validity", LastUID: "101",
+	}}
+	client := &remoteMailboxDeleteClientFixture{}
+	service := NewService(config.Default(), state)
+	service.messageBackend = backend
+	service.deleteClient = client
+
+	result, err := service.DeleteDomainMailboxesWithRemoteMessages(context.Background(), []string{mailbox.ID})
+	if err != nil {
+		t.Fatalf("删除已确认无邮件的域名邮箱失败：%v", err)
+	}
+	if len(client.operations) != 0 || result.CloudMessagesFound != 0 || result.FallbackAccounts != 0 || result.VerifiedMailboxes != 1 {
+		t.Fatalf("完整历史中的零匹配不应再扫描 Web：operations=%v result=%+v", client.operations, result)
+	}
+	if _, found := state.FindMailboxByID(mailbox.ID); found {
+		t.Fatal("确认云端无邮件后域名邮箱登记仍存在")
+	}
 }
 
 func (f *remoteMailboxDeleteClientFixture) EmptyTrash(context.Context, protocol.ICloudSession) (int, error) {
@@ -220,6 +432,80 @@ func TestCleanRemoteMailboxesPurgesAllLocalMessages(t *testing.T) {
 	}
 	if !reflect.DeepEqual(client.remoteIDs, []string{"icloud:Inbox:101"}) {
 		t.Fatalf("远端邮件标识不正确：%v", client.remoteIDs)
+	}
+}
+
+func newDomainDeleteServiceFixture(t *testing.T, count int) (*store.Store, []domain.Mailbox) {
+	t.Helper()
+	state, err := store.Open(filepath.Join(t.TempDir(), "app.db"))
+	if err != nil {
+		t.Fatalf("创建域名删除测试数据库失败：%v", err)
+	}
+	t.Cleanup(func() { _ = state.Close() })
+	session, err := state.SaveICloudSession(domain.ICloudSession{
+		AppleID: "domain-delete@icloud.com", DSID: "domain-delete-dsid", MailGatewayBaseURL: "https://mail.example.test",
+		Cookies: []domain.SessionCookie{{Name: "X-APPLE-WEBAUTH-TOKEN", Value: "fixture-token", Domain: ".icloud.com", Path: "/"}},
+	})
+	if err != nil {
+		t.Fatalf("创建域名删除测试账号失败：%v", err)
+	}
+	settings := domain.DefaultDomainMailSettings()
+	settings.Enabled = true
+	_, routes, err := state.SaveDomainMailConfig(settings, []domain.DomainMailRoute{{
+		Domain: "delete.example", ReceiverType: domain.DomainReceiverAppleAccount,
+		AccountID: session.AccountID, ForwardToEmail: session.AppleID,
+	}})
+	if err != nil || len(routes) != 1 {
+		t.Fatalf("创建域名删除测试路由失败：routes=%+v err=%v", routes, err)
+	}
+	emails := make([]string, 0, count)
+	for index := 0; index < count; index++ {
+		emails = append(emails, fmt.Sprintf("delete-%d@delete.example", index+1))
+	}
+	mailboxes, err := state.CreateDomainMailboxes(routes[0].ID, emails, "域名删除测试", "", true)
+	if err != nil {
+		t.Fatalf("创建域名删除测试邮箱失败：%v", err)
+	}
+	for index, mailbox := range mailboxes {
+		remoteID := fmt.Sprintf("imap:%d", 101+index)
+		if _, _, err := state.UpsertMessage(mailbox.ID, remoteID, "imap", fmt.Sprintf("域名邮件 %d", index+1), "sender@example.com", "正文", time.Now()); err != nil {
+			t.Fatalf("创建域名删除测试邮件失败：%v", err)
+		}
+	}
+	return state, mailboxes
+}
+
+func primeDomainDeleteIMAPHistory(t *testing.T, state *store.Store, mailbox domain.Mailbox, includeMessage bool) {
+	t.Helper()
+	session, found := state.ICloudSessionByAccountID(mailbox.AccountID)
+	if !found {
+		t.Fatal("域名删除测试账号登录态不存在")
+	}
+	imapState := domain.LoginState{
+		Kind: domain.LoginStateICloudIMAP, IMAPEmail: session.AppleID, IMAPUsername: session.AppleID,
+		IMAPHost: "imap.mail.me.com", IMAPPort: 993, IMAPAppPassword: "delete-app-password",
+	}
+	session.LoginStates = append(session.LoginStates, imapState)
+	if _, err := state.SaveICloudSession(session); err != nil {
+		t.Fatalf("保存域名删除测试 IMAP 登录态失败：%v", err)
+	}
+	commit := store.MailIndexCommit{SourceKey: mailbox.AccountID, Folder: "INBOX", UIDValidity: "delete-validity"}
+	if includeMessage {
+		commit.Entries = []store.MailIndexEntry{{
+			UID: "101", RemoteID: "imap:101", RemoteIDs: []string{"imap:101"}, Recipients: []string{mailbox.Email},
+			Source: "imap", Subject: "域名邮件", From: "sender@example.com", BodyComplete: true, IndexedAt: time.Now(),
+		}}
+	}
+	completedAt := time.Now()
+	commit.Histories = mailboxHistoryCommits([]domain.Mailbox{mailbox}, mailbox.AccountID, "delete-validity", "101", completedAt)
+	stateID := mailSyncStateID(mailbox.AccountID, "imap", "source")
+	cursor := MailSyncState{
+		AccountID: mailbox.AccountID, Method: "imap", Folder: "INBOX", UIDValidity: "delete-validity", LastScannedUID: "101",
+		LastSyncAt: completedAt, HistoryComplete: true, LastFullScanAt: completedAt, SourceSignature: imapSourceSignature(imapState),
+	}
+	updates := []store.MailboxSyncUpdate{{MailboxID: mailbox.ID, LastUID: "101", SyncedAt: completedAt}}
+	if _, err := state.ApplyMailboxSyncBatchWithIndex(updates, stateID, cursor, commit); err != nil {
+		t.Fatalf("建立域名删除测试 IMAP 历史失败：%v", err)
 	}
 }
 

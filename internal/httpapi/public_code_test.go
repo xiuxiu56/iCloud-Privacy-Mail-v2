@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -59,6 +60,118 @@ func TestPublicCodePageMessagesRequireEnabledSetting(t *testing.T) {
 	response := publicCodeTestRequest(t, server, "/api/v1/public-code/messages?email="+url.QueryEscape(mailbox.Email))
 	if response.Code != http.StatusForbidden {
 		t.Fatalf("关闭公共页面后的状态码为 %d，期望 403：%s", response.Code, response.Body.String())
+	}
+}
+
+func TestPublicMailboxMessageAPIUsesMailboxTokenAndReturnsKind(t *testing.T) {
+	state, err := store.Open(filepath.Join(t.TempDir(), "app.db"))
+	if err != nil {
+		t.Fatalf("创建测试数据库失败：%v", err)
+	}
+	t.Cleanup(func() { _ = state.Close() })
+	settings := state.Settings()
+	settings.EnablePublicMailboxAPI = true
+	if _, err := state.SaveSettings(settings); err != nil {
+		t.Fatalf("保存公共 API 设置失败：%v", err)
+	}
+	mailbox, _, err := state.UpsertMailboxFromRemote("account_fixture", domain.RemoteMailbox{Email: "external-api@icloud.com", IsActive: true}, "")
+	if err != nil {
+		t.Fatalf("创建测试邮箱失败：%v", err)
+	}
+	created, err := state.ApplyMailboxSyncBatch([]store.MailboxSyncUpdate{{MailboxID: mailbox.ID, Messages: []store.MailboxSyncMessage{{
+		RemoteID: "imap:88", Source: "imap", Subject: "外部 API 邮件", From: "sender@example.com", Body: "正文", ReceivedAt: time.Now(),
+	}}}})
+	if err != nil || created != 1 {
+		t.Fatalf("准备测试邮件失败：created=%d err=%v", created, err)
+	}
+	server := New(config.Default(), state, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	path := "/api/v1/mailboxes/" + url.PathEscape(mailbox.Email) + "/messages?key=" + url.QueryEscape(mailbox.APIToken)
+	response := publicCodeTestRequest(t, server, path)
+	if response.Code != http.StatusOK {
+		t.Fatalf("外部邮件列表接口状态码为 %d：%s", response.Code, response.Body.String())
+	}
+	data := publicCodeTestData(t, response)
+	if data["mailbox_kind"] != domain.MailboxKindICloudHME {
+		t.Fatalf("外部邮件列表没有返回邮箱类型：%+v", data)
+	}
+	items, _ := data["items"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("外部邮件列表不正确：%+v", data)
+	}
+	messageID, _ := items[0].(map[string]any)["id"].(string)
+	detailPath := "/api/v1/mailboxes/" + url.PathEscape(mailbox.Email) + "/messages/" + url.PathEscape(messageID) + "?key=" + url.QueryEscape(mailbox.APIToken)
+	detail := publicCodeTestRequest(t, server, detailPath)
+	if detail.Code != http.StatusOK || publicCodeTestData(t, detail)["mailbox_kind"] != domain.MailboxKindICloudHME {
+		t.Fatalf("外部邮件详情接口不正确：status=%d body=%s", detail.Code, detail.Body.String())
+	}
+}
+
+func TestDomainMailboxExternalAPISupportsClaimCodeAndMessages(t *testing.T) {
+	state, err := store.Open(filepath.Join(t.TempDir(), "app.db"))
+	if err != nil {
+		t.Fatalf("创建测试数据库失败：%v", err)
+	}
+	t.Cleanup(func() { _ = state.Close() })
+	settings := state.Settings()
+	settings.EnablePublicMailboxAPI = true
+	settings.PublicAPIKey = "domain-api-key"
+	if _, err := state.SaveSettings(settings); err != nil {
+		t.Fatalf("保存公共 API 设置失败：%v", err)
+	}
+	domainSettings := domain.DefaultDomainMailSettings()
+	domainSettings.Enabled = true
+	_, routes, err := state.SaveDomainMailConfig(domainSettings, []domain.DomainMailRoute{{
+		Domain: "api.example.net", ReceiverType: domain.DomainReceiverCustomIMAP, ForwardToEmail: "receiver@example.net",
+		IMAPHost: "imap.example.net", IMAPPort: 993, IMAPUsername: "receiver@example.net", IMAPPassword: "fixture-password", IMAPTLS: true,
+	}})
+	if err != nil || len(routes) != 1 {
+		t.Fatalf("创建域名邮箱路由失败：routes=%+v err=%v", routes, err)
+	}
+	created, err := state.CreateDomainMailboxes(routes[0].ID, []string{"external@api.example.net"}, "外部 API 域名邮箱", "", true)
+	if err != nil || len(created) != 1 {
+		t.Fatalf("创建域名邮箱失败：items=%+v err=%v", created, err)
+	}
+	mailbox, found := state.FindMailboxByID(created[0].ID)
+	if !found {
+		t.Fatal("未找到已创建的域名邮箱")
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	createdMessages, err := state.ApplyMailboxSyncBatch([]store.MailboxSyncUpdate{{MailboxID: mailbox.ID, Messages: []store.MailboxSyncMessage{{
+		RemoteID: "imap:188", Source: "imap", Subject: "OpenAI 登录验证码", From: "OpenAI <noreply@example.com>",
+		Body: "验证码是 654321", ContentType: "text/plain", ReceivedAt: now,
+	}}}})
+	if err != nil || createdMessages != 1 {
+		t.Fatalf("保存域名邮箱测试邮件失败：created=%d err=%v", createdMessages, err)
+	}
+	server := New(config.Default(), state, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	claimRequest := httptest.NewRequest(http.MethodPost, "/api/v1/mailboxes/claim", strings.NewReader(`{
+		"project":"domain-api-test","purpose":"领取域名邮箱","request_id":"domain-claim-1",
+		"mailbox_kind":"domain_forward","domain":"api.example.net"
+	}`))
+	claimRequest.Header.Set("Content-Type", "application/json")
+	claimRequest.Header.Set("X-API-Key", "domain-api-key")
+	claim := httptest.NewRecorder()
+	server.ServeHTTP(claim, claimRequest)
+	if claim.Code != http.StatusOK {
+		t.Fatalf("域名邮箱领取接口状态码为 %d：%s", claim.Code, claim.Body.String())
+	}
+	claimedMailbox, _ := publicCodeTestData(t, claim)["mailbox"].(map[string]any)
+	if claimedMailbox["mailbox_kind"] != domain.MailboxKindDomainForward || claimedMailbox["email"] != mailbox.Email {
+		t.Fatalf("外部 API 领取的域名邮箱不正确：%+v", claimedMailbox)
+	}
+
+	codePath := "/api/v1/mailboxes/" + url.PathEscape(mailbox.Email) + "/code?cache=1&key=domain-api-key"
+	code := publicCodeTestRequest(t, server, codePath)
+	if code.Code != http.StatusOK || publicCodeTestData(t, code)["code"] != "654321" {
+		t.Fatalf("域名邮箱外部取码接口不正确：status=%d body=%s", code.Code, code.Body.String())
+	}
+	listPath := "/api/v1/mailboxes/" + url.PathEscape(mailbox.Email) + "/messages?key=domain-api-key"
+	list := publicCodeTestRequest(t, server, listPath)
+	listData := publicCodeTestData(t, list)
+	items, _ := listData["items"].([]any)
+	if list.Code != http.StatusOK || listData["mailbox_kind"] != domain.MailboxKindDomainForward || len(items) != 1 {
+		t.Fatalf("域名邮箱外部邮件接口不正确：status=%d data=%+v", list.Code, listData)
 	}
 }
 

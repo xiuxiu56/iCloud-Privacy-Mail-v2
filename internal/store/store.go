@@ -72,6 +72,18 @@ func (s *Store) initializeDatabase() error {
 		_ = tx.Rollback()
 		return err
 	}
+	domainMailSettings := domain.DefaultDomainMailSettings()
+	if found, err := s.readEntityTx(tx, "domain_mail_settings", "system", &domainMailSettings); err != nil {
+		_ = tx.Rollback()
+		return err
+	} else if !found {
+		domainMailSettings = domain.DefaultDomainMailSettings()
+	}
+	normalizeDomainMailSettings(&domainMailSettings)
+	if _, _, err := s.upsertEntityTx(tx, "domain_mail_settings", "domain-mail-settings", "system", domainMailSettings); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
 	var createSettings domain.CreateSettings
 	if found, err := s.readEntityTx(tx, "create_settings", "system", &createSettings); err != nil {
 		_ = tx.Rollback()
@@ -166,6 +178,8 @@ func (s *Store) Snapshot() domain.State {
 	state := domain.State{SchemaVersion: domain.SchemaVersion, Settings: domain.DefaultSettings(), CreateSettings: domain.DefaultCreateSettings()}
 	_ = s.loadEntities("apple_accounts", `json_extract(data_json, '$.created_at')`, &state.AppleAccounts)
 	_ = s.loadEntities("mailboxes", `json_extract(data_json, '$.created_at')`, &state.Mailboxes)
+	_ = s.loadEntities("domain_mail_routes", `json_extract(data_json, '$.created_at')`, &state.DomainMailRoutes)
+	_, _ = s.readEntity("domain_mail_settings", "system", &state.DomainMailSettings)
 	_ = s.loadEntities("mailbox_leases", `json_extract(data_json, '$.created_at')`, &state.MailboxLeases)
 	_ = s.loadEntities("messages", `json_extract(data_json, '$.received_at')`, &state.Messages)
 	_ = s.loadEntities("events", `json_extract(data_json, '$.created_at')`, &state.Events)
@@ -402,7 +416,8 @@ func (s *Store) Mailboxes(query, status, accountID string, page, pageSize int) d
 	if pageSize > 200 {
 		pageSize = 200
 	}
-	where := []string{"1 = 1"}
+	// 邮箱池页面只展示 Apple 隐私邮箱；域名邮箱由独立页面管理。
+	where := []string{`COALESCE(json_extract(data_json, '$.mailbox_kind'), 'icloud_hme') = 'icloud_hme'`}
 	args := []any{}
 	if accountID != "" {
 		where = append(where, `json_extract(data_json, '$.account_id') = ?`)
@@ -436,6 +451,7 @@ func (s *Store) Mailboxes(query, status, accountID string, page, pageSize int) d
 			var mailbox domain.Mailbox
 			if rows.Scan(&data) == nil && s.decodeEntity("mailboxes", data, &mailbox) == nil {
 				mailbox.APIToken = ""
+				mailbox = sanitizeMailboxKind(mailbox)
 				items = append(items, mailbox)
 			}
 		}

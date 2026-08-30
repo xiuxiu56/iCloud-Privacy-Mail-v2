@@ -23,13 +23,34 @@ var (
 	ErrLeaseReconcileState  = errors.New("只有已释放或已过期的邮箱租约可以执行已绑定纠偏")
 )
 
+type MailboxClaimFilter struct {
+	MailboxKind string
+	Domain      string
+}
+
 // ClaimMailboxLease 在单个 SQLite 事务中原子执行 available -> reserved。
 func (s *Store) ClaimMailboxLease(project, purpose, requestID, note string, ttl time.Duration, now time.Time) (domain.Mailbox, domain.MailboxLease, bool, error) {
+	return s.ClaimMailboxLeaseFiltered(project, purpose, requestID, note, ttl, now, MailboxClaimFilter{})
+}
+
+// ClaimMailboxLeaseFiltered 按邮箱类型和接收域名原子领取邮箱；空筛选保持原接口行为。
+func (s *Store) ClaimMailboxLeaseFiltered(project, purpose, requestID, note string, ttl time.Duration, now time.Time, filter MailboxClaimFilter) (domain.Mailbox, domain.MailboxLease, bool, error) {
 	project = normalizeLeaseProject(project)
 	if project == "" {
 		return domain.Mailbox{}, domain.MailboxLease{}, false, ErrLeaseProjectRequired
 	}
 	purpose, requestID, note = strings.TrimSpace(purpose), strings.TrimSpace(requestID), strings.TrimSpace(note)
+	filter.MailboxKind = strings.ToLower(strings.TrimSpace(filter.MailboxKind))
+	if filter.MailboxKind == "any" {
+		filter.MailboxKind = ""
+	}
+	filter.Domain = normalizeDomainName(filter.Domain)
+	if filter.MailboxKind != "" && filter.MailboxKind != domain.MailboxKindICloudHME && filter.MailboxKind != domain.MailboxKindDomainForward {
+		return domain.Mailbox{}, domain.MailboxLease{}, false, errors.New("mailbox_kind 只支持 icloud_hme、domain_forward 或留空")
+	}
+	if filter.Domain != "" && filter.MailboxKind != domain.MailboxKindDomainForward {
+		return domain.Mailbox{}, domain.MailboxLease{}, false, errors.New("domain 仅用于领取 domain_forward 域名邮箱")
+	}
 	if ttl <= 0 {
 		ttl = 30 * time.Minute
 	}
@@ -66,6 +87,11 @@ func (s *Store) ClaimMailboxLease(project, purpose, requestID, note string, ttl 
 				_ = tx.Rollback()
 				return domain.Mailbox{}, lease, false, ErrLeaseBindingConflict
 			}
+			mailbox = sanitizeMailboxKind(mailbox)
+			if !mailboxMatchesClaimFilter(mailbox, filter) {
+				_ = tx.Rollback()
+				return domain.Mailbox{}, lease, false, ErrLeaseRequestConflict
+			}
 			if len(expiryChanges) > 0 {
 				if err := s.commitTx(tx, expiryChanges); err != nil {
 					return domain.Mailbox{}, lease, false, err
@@ -81,12 +107,26 @@ func (s *Store) ClaimMailboxLease(project, purpose, requestID, note string, ttl 
 		}
 	}
 	var mailboxData []byte
-	err = tx.QueryRow(`SELECT data_json FROM mailboxes
+	query := `SELECT data_json FROM mailboxes
 		WHERE json_extract(data_json, '$.api_active') = 1
 		AND json_extract(data_json, '$.icloud_active') = 1
 		AND json_extract(data_json, '$.status') = ?
 		AND COALESCE(json_extract(data_json, '$.active_lease_id'), '') = ''
-		ORDER BY json_extract(data_json, '$.created_at') ASC LIMIT 1`, domain.StatusAvailable).Scan(&mailboxData)
+		AND (
+			COALESCE(json_extract(data_json, '$.mailbox_kind'), 'icloud_hme') <> 'domain_forward'
+			OR COALESCE((SELECT json_extract(data_json, '$.enabled') FROM domain_mail_settings WHERE id = 'system'), 0) = 1
+		)`
+	args := []any{domain.StatusAvailable}
+	if filter.MailboxKind != "" {
+		query += ` AND COALESCE(json_extract(data_json, '$.mailbox_kind'), 'icloud_hme') = ?`
+		args = append(args, filter.MailboxKind)
+	}
+	if filter.Domain != "" {
+		query += ` AND lower(substr(json_extract(data_json, '$.email'), instr(json_extract(data_json, '$.email'), '@') + 1)) = ?`
+		args = append(args, filter.Domain)
+	}
+	query += ` ORDER BY json_extract(data_json, '$.created_at') ASC LIMIT 1`
+	err = tx.QueryRow(query, args...).Scan(&mailboxData)
 	if errors.Is(err, sql.ErrNoRows) {
 		if len(expiryChanges) > 0 {
 			_ = s.commitTx(tx, expiryChanges)
@@ -104,6 +144,7 @@ func (s *Store) ClaimMailboxLease(project, purpose, requestID, note string, ttl 
 		_ = tx.Rollback()
 		return domain.Mailbox{}, domain.MailboxLease{}, false, err
 	}
+	mailbox = sanitizeMailboxKind(mailbox)
 	id, err := s.nextIDTx(tx, "lease")
 	if err != nil {
 		_ = tx.Rollback()
@@ -131,6 +172,18 @@ func (s *Store) ClaimMailboxLease(project, purpose, requestID, note string, ttl 
 	}
 	changes := append(expiryChanges, leaseChange, mailboxChange, eventChange)
 	return mailbox, lease, true, s.commitTx(tx, changes)
+}
+
+func mailboxMatchesClaimFilter(mailbox domain.Mailbox, filter MailboxClaimFilter) bool {
+	if filter.MailboxKind != "" && normalizeMailboxKind(mailbox.MailboxKind) != filter.MailboxKind {
+		return false
+	}
+	if filter.Domain == "" {
+		return true
+	}
+	email := strings.ToLower(strings.TrimSpace(mailbox.Email))
+	separator := strings.LastIndexByte(email, '@')
+	return separator >= 0 && normalizeDomainName(email[separator+1:]) == filter.Domain
 }
 
 func (s *Store) CommitMailboxLease(leaseID, project, note string, now time.Time) (domain.Mailbox, domain.MailboxLease, bool, error) {

@@ -47,6 +47,9 @@ func (s *Server) handlePublicHealth(w http.ResponseWriter, r *http.Request) {
 			"lease_ttl_seconds":          s.cfg.PublicMailboxLeaseTTLMinutes * 60,
 			"lease_max_ttl_seconds":      s.cfg.PublicMailboxLeaseMaxTTLMinutes * 60,
 			"mailbox_note_api_supported": true,
+			"mailbox_kind_filters":       []string{"any", domain.MailboxKindICloudHME, domain.MailboxKindDomainForward},
+			"domain_filter_supported":    true,
+			"message_api_supported":      true,
 			"time":                       time.Now().Format(time.RFC3339),
 		},
 	})
@@ -62,11 +65,13 @@ func (s *Server) handlePublicClaimMailbox(w http.ResponseWriter, r *http.Request
 		return
 	}
 	var body struct {
-		Project    string `json:"project"`
-		Purpose    string `json:"purpose"`
-		RequestID  string `json:"request_id"`
-		Note       string `json:"note"`
-		TTLSeconds int    `json:"ttl_seconds"`
+		Project     string `json:"project"`
+		Purpose     string `json:"purpose"`
+		RequestID   string `json:"request_id"`
+		Note        string `json:"note"`
+		TTLSeconds  int    `json:"ttl_seconds"`
+		MailboxKind string `json:"mailbox_kind"`
+		Domain      string `json:"domain"`
 	}
 	if r.ContentLength != 0 {
 		if err := decodeJSON(r, &body); err != nil {
@@ -74,13 +79,26 @@ func (s *Server) handlePublicClaimMailbox(w http.ResponseWriter, r *http.Request
 			return
 		}
 	}
-	mailbox, lease, created, err := s.store.ClaimMailboxLease(
+	body.MailboxKind = strings.ToLower(strings.TrimSpace(body.MailboxKind))
+	if body.MailboxKind == "any" {
+		body.MailboxKind = ""
+	}
+	if body.MailboxKind != "" && body.MailboxKind != domain.MailboxKindICloudHME && body.MailboxKind != domain.MailboxKindDomainForward {
+		writeError(w, http.StatusBadRequest, "invalid_mailbox_kind", "mailbox_kind 只支持 icloud_hme、domain_forward 或留空")
+		return
+	}
+	if strings.TrimSpace(body.Domain) != "" && body.MailboxKind != domain.MailboxKindDomainForward {
+		writeError(w, http.StatusBadRequest, "invalid_mailbox_domain", "domain 仅用于领取 domain_forward 域名邮箱")
+		return
+	}
+	mailbox, lease, created, err := s.store.ClaimMailboxLeaseFiltered(
 		body.Project,
 		body.Purpose,
 		body.RequestID,
 		body.Note,
 		s.mailboxLeaseTTL(body.TTLSeconds),
 		time.Now(),
+		store.MailboxClaimFilter{MailboxKind: body.MailboxKind, Domain: body.Domain},
 	)
 	if err != nil {
 		if errors.Is(err, store.ErrNoAvailableMailbox) {
@@ -292,6 +310,100 @@ func (s *Server) handlePublicMailboxCode(w http.ResponseWriter, r *http.Request)
 	}
 }
 
+func (s *Server) handlePublicMailboxMessages(w http.ResponseWriter, r *http.Request) {
+	mailbox, ok := s.publicAPIMailbox(w, r)
+	if !ok {
+		return
+	}
+	var syncErr error
+	if parseBool(r.URL.Query().Get("sync")) {
+		minInterval := time.Duration(s.cfg.PublicSyncMinIntervalMS) * time.Millisecond
+		if minInterval < 0 {
+			minInterval = 0
+		}
+		if mailbox.LastSyncAt.IsZero() || time.Since(mailbox.LastSyncAt) >= minInterval {
+			syncCtx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
+			_, syncErr = s.mailbox.SyncPublicMessages(syncCtx, mailbox.ID)
+			cancel()
+		}
+	}
+	items := s.store.MessagesForMailbox(mailbox.ID)
+	total := len(items)
+	limit := 50
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	if len(items) > limit {
+		items = items[:limit]
+	}
+	summaries := make([]map[string]any, 0, len(items))
+	for _, message := range items {
+		summaries = append(summaries, publicMessageSummary(message))
+	}
+	data := map[string]any{"email": mailbox.Email, "mailbox_kind": publicMailboxKind(mailbox), "items": summaries, "total": total}
+	if refreshed, found := s.store.FindMailboxByID(mailbox.ID); found && !refreshed.LastSyncAt.IsZero() {
+		data["last_sync_at"] = refreshed.LastSyncAt
+	}
+	if syncErr != nil {
+		data["sync_error"] = "同步邮件失败，当前显示本地已保存的邮件"
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": data})
+}
+
+func (s *Server) handlePublicMailboxMessage(w http.ResponseWriter, r *http.Request) {
+	mailbox, ok := s.publicAPIMailbox(w, r)
+	if !ok {
+		return
+	}
+	message, err := s.mailbox.MessageContent(r.Context(), mailbox.ID, r.PathValue("messageID"))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": map[string]any{
+		"email": mailbox.Email, "mailbox_kind": publicMailboxKind(mailbox), "message": publicMessageContent(message),
+	}})
+}
+
+func (s *Server) publicAPIMailbox(w http.ResponseWriter, r *http.Request) (domain.Mailbox, bool) {
+	if !s.store.Settings().EnablePublicMailboxAPI {
+		writeError(w, http.StatusForbidden, "public_api_disabled", "公共取号 API 尚未开启")
+		return domain.Mailbox{}, false
+	}
+	email, err := url.PathUnescape(r.PathValue("email"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_email", "邮箱地址格式不正确")
+		return domain.Mailbox{}, false
+	}
+	mailbox, ok := s.store.FindMailboxByEmail(email)
+	if !ok {
+		writeError(w, http.StatusNotFound, "mailbox_not_found", "邮箱不存在")
+		return domain.Mailbox{}, false
+	}
+	if !s.authorizedMailboxAPI(r, mailbox) {
+		writeError(w, http.StatusUnauthorized, "invalid_api_key", "API Key 错误")
+		return domain.Mailbox{}, false
+	}
+	if !mailbox.APIActive || mailbox.Status == domain.StatusDisabled {
+		writeError(w, http.StatusForbidden, "api_disabled", "邮箱 API 已停用")
+		return domain.Mailbox{}, false
+	}
+	if !mailbox.ICloudActive {
+		writeError(w, http.StatusForbidden, "mailbox_inactive", "邮箱收件已停用")
+		return domain.Mailbox{}, false
+	}
+	if publicMailboxKind(mailbox) == domain.MailboxKindDomainForward && !s.store.DomainMailSettings().Enabled {
+		writeError(w, http.StatusForbidden, "domain_mail_disabled", "域名邮箱接收尚未开启")
+		return domain.Mailbox{}, false
+	}
+	return mailbox, true
+}
+
 func (s *Server) handlePublicCodePageStatus(w http.ResponseWriter, _ *http.Request) {
 	settings := s.store.Settings()
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -353,7 +465,7 @@ func (s *Server) handlePublicCodePageMessages(w http.ResponseWriter, r *http.Req
 		}
 		if mailbox.LastSyncAt.IsZero() || time.Since(mailbox.LastSyncAt) >= minInterval {
 			syncCtx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
-			_, syncErr = s.mailbox.SyncMessages(syncCtx, mailbox.ID)
+			_, syncErr = s.mailbox.SyncPublicMessages(syncCtx, mailbox.ID)
 			cancel()
 		}
 	}
@@ -579,16 +691,33 @@ func writeDownload(w http.ResponseWriter, contentType, filename string, body []b
 }
 
 func (s *Server) publicMailbox(r *http.Request, mailbox domain.Mailbox, includeAPI bool) map[string]any {
+	kind := publicMailboxKind(mailbox)
 	out := map[string]any{
 		"id": mailbox.ID, "account_id": mailbox.AccountID, "label": mailbox.Label, "email": mailbox.Email,
-		"api_active": mailbox.APIActive, "icloud_active": mailbox.ICloudActive, "status": mailbox.Status,
+		"mailbox_kind": kind,
+		"api_active":   mailbox.APIActive, "icloud_active": mailbox.ICloudActive, "status": mailbox.Status,
 		"note": mailbox.Note, "active_lease_id": mailbox.ActiveLeaseID, "receive_count": mailbox.ReceiveCount, "last_sync_at": mailbox.LastSyncAt,
+	}
+	if kind == domain.MailboxKindDomainForward {
+		if separator := strings.LastIndexByte(mailbox.Email, '@'); separator >= 0 {
+			out["domain"] = strings.ToLower(mailbox.Email[separator+1:])
+		}
+		if route, found := s.store.FindDomainMailRoute(mailbox.DomainRouteID); found {
+			out["receiver_type"] = route.ReceiverType
+		}
 	}
 	if includeAPI {
 		out["api_url"] = s.mailboxAPIURL(r, mailbox)
 		out["api_token_mask"] = maskSecret(mailbox.APIToken)
 	}
 	return out
+}
+
+func publicMailboxKind(mailbox domain.Mailbox) string {
+	if strings.TrimSpace(mailbox.MailboxKind) == "" {
+		return domain.MailboxKindICloudHME
+	}
+	return mailbox.MailboxKind
 }
 
 func (s *Server) mailboxAPIURL(r *http.Request, mailbox domain.Mailbox) string {

@@ -1,11 +1,13 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { Bell, CalendarClock, CheckCircle2, CircleAlert, Cloud, Database, ExternalLink, Eye, EyeOff, FolderGit2, GitCommit, Globe2, KeyRound, LoaderCircle, LogIn, Monitor, PackageOpen, RefreshCw, Save, Send, ShieldCheck, Sparkles, Trash2, WifiOff } from '@lucide/vue'
+import { ArrowRight, AtSign, Bell, CalendarClock, CheckCircle2, CircleAlert, Cloud, Database, ExternalLink, Eye, EyeOff, FolderGit2, GitCommit, Globe2, Inbox, KeyRound, LoaderCircle, LogIn, Mail, Monitor, PackageOpen, Plus, RefreshCw, Save, Send, ShieldCheck, Sparkles, Trash2, WifiOff, X } from '@lucide/vue'
 import { useRoute } from 'vue-router'
 import { api } from '../api/client'
+import CardSelect from '../components/CardSelect.vue'
 import { subscribeRealtime } from '../composables/useRealtime'
 import { useToast } from '../composables/useToast'
 import { useUpdates } from '../composables/useUpdates'
+import { loadDomainMailPreview, normalizeDomain, normalizeDomainRoutes, normalizeDomains, saveDomainMailPreview } from '../domainMailPreview'
 
 const loading = ref(true)
 const route = useRoute()
@@ -13,6 +15,9 @@ const saving = ref('')
 const dataPath = ref('')
 const runtime = ref({})
 const showPublicAPIKey = ref(false)
+const showDomainIMAPPassword = ref(false)
+const domainDraft = ref('')
+const appleAccountOptions = ref([])
 let runtimeRefreshTimer
 let realtimeRefreshTimer
 let realtimeUnsubscribe = () => {}
@@ -32,6 +37,25 @@ const form = reactive({
   notify_admin_login: false,
   notify_account_login_state_offline: false,
 })
+const domainForm = reactive(loadDomainMailPreview())
+const domainIMAPPasswords = reactive({})
+const domainIMAPPassword = computed({
+	get() {
+		return domainIMAPPasswords[normalizeDomain(domainForm.active_domain)] || ''
+	},
+	set(value) {
+		const activeDomain = normalizeDomain(domainForm.active_domain)
+		if (activeDomain) domainIMAPPasswords[activeDomain] = value
+	},
+})
+const domainModeOptions = [
+  { value: 'catch_all', label: '全收并自动发现', description: '按原始收件人创建本地邮箱', dot: 'bg-emerald-500' },
+  { value: 'registered_only', label: '只允许已生成的邮箱前缀', description: '只收件并查询域名邮箱页面已生成的地址', dot: 'bg-sky-500' },
+]
+const domainReceiverOptions = [
+  { value: 'apple_account', label: '复用现有 iCloud IMAP', description: '选择 Apple 账号页面已保存的 IMAP 登录', dot: 'bg-sky-500' },
+  { value: 'custom_imap', label: '配置标准 IMAP', description: '支持 Gmail、Outlook 和其他 IMAP 邮箱', dot: 'bg-violet-500' },
+]
 const { success, error: showError } = useToast()
 const { updateState, showChecking, loadUpdates } = useUpdates()
 const publicAPIKeyReady = computed(() => Boolean(String(form.public_api_key || '').trim() || runtime.value.config_api_key_configured))
@@ -60,6 +84,37 @@ const mailWatcherStatusClass = computed(() => {
 const databaseStatus = computed(() => runtime.value.database_status || {})
 const serverChanReady = computed(() => Boolean(String(form.server_chan_send_key || '').trim() || runtime.value.server_chan_configured))
 const serverChanKeyPlaceholder = '输入 SCT 开头的 SendKey'
+const domainList = computed(() => normalizeDomains(domainForm.domains))
+const domainReceiverEmail = computed({
+  get() {
+    if (domainForm.receiver_type === 'apple_account') {
+      const selectedOption = appleAccountOptions.value.find((item) => String(item.value) === String(domainForm.account_id))
+      return String(domainForm.forward_to_email || selectedOption?.receiverEmail || selectedOption?.description || '').trim().toLowerCase()
+    }
+    return String(domainForm.forward_to_email || '').trim().toLowerCase()
+  },
+  set(value) {
+    domainForm.forward_to_email = String(value || '').trim().toLowerCase()
+  },
+})
+const domainRoutes = computed(() => currentDomainRoutes())
+const domainRouteReady = computed(() => Boolean(
+  domainForm.enabled
+  && domainRoutes.value.length
+  && domainRoutes.value.every((item) => String(item.forward_to_email || '').trim()
+    && (item.receiver_type === 'custom_imap'
+      ? String(item.imap_host || '').trim() && String(item.imap_username || '').trim()
+      : String(item.account_id || '').trim())),
+))
+const domainReceiverText = computed(() => {
+  if (domainRoutes.value.length > 1) return `已配置 ${domainRoutes.value.length} 条独立接收链路`
+  if (domainForm.receiver_type === 'custom_imap') return domainForm.receiver_label || domainForm.imap_username || '其他邮箱 IMAP'
+  return appleAccountOptions.value.find((item) => String(item.value) === String(domainForm.account_id))?.label || '尚未选择收件账号'
+})
+const domainRouteText = computed(() => {
+  if (!domainRoutes.value.length) return '添加接收域名与接收邮箱后显示接收链路'
+  return domainRoutes.value.map((item) => `@${item.domain} → ${item.forward_to_email || '未设置接收邮箱'}`).join('；')
+})
 
 function formatBytes(value) {
   const bytes = Number(value || 0)
@@ -83,14 +138,129 @@ function generatePublicAPIKey() {
   notify('公共 API Key 已生成，请保存系统设置')
 }
 
+function domainReceiverSnapshot(domain) {
+	const existing = currentStoredDomainRoute(domain)
+  return {
+	id: existing?.id || '',
+    domain: normalizeDomain(domain),
+    receiver_type: domainForm.receiver_type === 'custom_imap' ? 'custom_imap' : 'apple_account',
+    account_id: String(domainForm.account_id || '').trim(),
+    receiver_label: String(domainForm.receiver_label || '').trim(),
+    imap_host: String(domainForm.imap_host || '').trim().toLowerCase(),
+    imap_port: Math.min(65535, Math.max(1, Number(domainForm.imap_port) || 993)),
+    imap_username: String(domainForm.imap_username || '').trim(),
+    imap_tls: Boolean(domainForm.imap_tls),
+    forward_to_email: domainReceiverEmail.value,
+	imap_password_configured: Boolean(existing?.imap_password_configured || domainForm.imap_password_configured),
+  }
+}
+
+function currentStoredDomainRoute(domain) {
+	const target = normalizeDomain(domain)
+	return Array.isArray(domainForm.routes) ? domainForm.routes.find((item) => normalizeDomain(item.domain) === target) : null
+}
+
+function currentDomainRoutes() {
+  const routes = normalizeDomainRoutes(domainForm.routes, domainList.value, domainForm)
+  const activeDomain = normalizeDomain(domainForm.active_domain)
+  if (!activeDomain) return routes
+  return routes.map((item) => item.domain === activeDomain ? domainReceiverSnapshot(activeDomain) : item)
+}
+
+function selectDomainRoute(domain) {
+  const targetDomain = normalizeDomain(domain)
+  if (!targetDomain || targetDomain === normalizeDomain(domainForm.active_domain)) return
+  domainForm.routes = currentDomainRoutes()
+  const selectedRoute = domainForm.routes.find((item) => item.domain === targetDomain)
+  if (!selectedRoute) return
+  domainForm.active_domain = targetDomain
+  Object.assign(domainForm, {
+	id: selectedRoute.id,
+    receiver_type: selectedRoute.receiver_type,
+    account_id: selectedRoute.account_id,
+    receiver_label: selectedRoute.receiver_label,
+    imap_host: selectedRoute.imap_host,
+    imap_port: selectedRoute.imap_port,
+    imap_username: selectedRoute.imap_username,
+    imap_tls: selectedRoute.imap_tls,
+    forward_to_email: selectedRoute.forward_to_email,
+	imap_password_configured: Boolean(selectedRoute.imap_password_configured),
+  })
+}
+
+function addDomains() {
+  const rawItems = String(domainDraft.value || '').split(/[,\s;，；]+/).filter(Boolean)
+  if (!rawItems.length) return true
+  const invalid = rawItems.map(normalizeDomain).find((item) => !/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(item))
+  if (invalid) {
+    notify(`域名格式不正确：${invalid}`, true)
+    return false
+  }
+  const currentRoutes = currentDomainRoutes()
+  const existingDomains = new Set(currentRoutes.map((item) => item.domain))
+  const addedDomains = normalizeDomains(rawItems).filter((item) => !existingDomains.has(item))
+  domainForm.domains = normalizeDomains([...domainList.value, ...addedDomains])
+  domainForm.routes = [
+    ...currentRoutes,
+    ...addedDomains.map((domain) => domainReceiverSnapshot(domain)),
+  ]
+  domainForm.domain = domainForm.domains[0] || ''
+  if (addedDomains.length) {
+    domainForm.active_domain = addedDomains[addedDomains.length - 1]
+  }
+  domainDraft.value = ''
+  return true
+}
+
+function removeDomain(domain) {
+  const targetDomain = normalizeDomain(domain)
+	delete domainIMAPPasswords[targetDomain]
+  domainForm.routes = currentDomainRoutes().filter((item) => item.domain !== targetDomain)
+  domainForm.domains = domainList.value.filter((item) => item !== targetDomain)
+  domainForm.domain = domainForm.domains[0] || ''
+  if (normalizeDomain(domainForm.active_domain) === targetDomain) {
+    const nextDomain = domainForm.domains[0] || ''
+    domainForm.active_domain = ''
+    if (nextDomain) selectDomainRoute(nextDomain)
+  }
+}
+
 async function load(options = {}) {
   const silent = Boolean(options.silent)
   if (!silent) loading.value = true
   try {
-    const settingsData = await api('/api/settings')
+    const [settingsData, accountData, domainData] = await Promise.all([
+      api('/api/settings'),
+      api('/api/apple-accounts').catch(() => ({ items: [] })),
+      api('/api/domain-mail/settings').catch(() => ({ settings: {}, routes: [] })),
+    ])
     Object.assign(form, settingsData.settings || {})
     dataPath.value = settingsData.data_path || ''
     runtime.value = settingsData.runtime || {}
+    appleAccountOptions.value = (accountData.items || []).map((account) => ({
+      value: account.id,
+      label: account.label || account.apple_id || account.id,
+      description: account.apple_id || 'iCloud IMAP 收件账号',
+      receiverEmail: account.imap_email || account.apple_id || '',
+      dot: account.imap_saved ? 'bg-emerald-500' : 'bg-amber-500',
+    }))
+	const backendRoutes = Array.isArray(domainData.routes) ? domainData.routes : []
+	const savedRoutes = backendRoutes.length ? backendRoutes : currentDomainRoutes()
+	const savedDomains = savedRoutes.map((item) => item.domain)
+	const activeDomain = savedDomains.includes(domainForm.active_domain) ? domainForm.active_domain : (savedDomains[0] || '')
+	Object.assign(domainForm, {
+		...domainData.settings,
+		domains: savedDomains,
+		routes: savedRoutes,
+		domain: savedDomains[0] || '',
+		active_domain: activeDomain,
+	})
+	if (activeDomain) {
+		const activeRoute = savedRoutes.find((item) => item.domain === activeDomain)
+		if (activeRoute) Object.assign(domainForm, activeRoute)
+	}
+    if (!domainForm.account_id && appleAccountOptions.value.length === 1) domainForm.account_id = appleAccountOptions.value[0].value
+	if (domainForm.account_id && !domainForm.forward_to_email) await selectDomainAccount(domainForm.account_id)
   } catch (err) {
     notify(err.message, true)
   } finally {
@@ -99,16 +269,81 @@ async function load(options = {}) {
 }
 
 async function saveSystem() {
+  if (!addDomains()) return
+  const routes = currentDomainRoutes()
+  const invalidEmailRoute = routes.find((item) => !/^\S+@\S+\.\S+$/.test(String(item.forward_to_email || '').trim()))
+  if (domainForm.enabled && (!routes.length || invalidEmailRoute)) {
+    notify(invalidEmailRoute ? `请为 @${invalidEmailRoute.domain} 填写有效的接收邮箱` : '请添加至少一个接收域名', true)
+    return
+  }
+  const missingAppleRoute = routes.find((item) => item.receiver_type === 'apple_account' && !String(item.account_id || '').trim())
+  if (domainForm.enabled && missingAppleRoute) {
+    notify(`请为 @${missingAppleRoute.domain} 选择已配置 IMAP 的 iCloud 账号`, true)
+    return
+  }
+  const missingIMAPRoute = routes.find((item) => item.receiver_type === 'custom_imap' && (!String(item.imap_host || '').trim() || !String(item.imap_username || '').trim()))
+  if (domainForm.enabled && missingIMAPRoute) {
+    notify(`请为 @${missingIMAPRoute.domain} 填写标准 IMAP 主机和用户名`, true)
+    return
+  }
   saving.value = 'system'
   try {
-    const data = await api('/api/settings', { method: 'PUT', body: JSON.stringify(form) })
+    const routesPayload = routes.map((item) => ({
+		...item,
+		imap_password: domainIMAPPasswords[item.domain] || '',
+	}))
+	const [data, savedDomainData] = await Promise.all([
+		api('/api/settings', { method: 'PUT', body: JSON.stringify(form) }),
+		api('/api/domain-mail/settings', {
+			method: 'PUT',
+			body: JSON.stringify({
+				enabled: domainForm.enabled,
+				match_mode: domainForm.match_mode,
+				auto_discover: domainForm.auto_discover,
+				default_api_active: domainForm.default_api_active,
+				routes: routesPayload,
+			}),
+		}),
+	])
     Object.assign(form, data.settings || {})
+	const savedRoutes = savedDomainData.routes || []
+	const activeDomain = normalizeDomain(domainForm.active_domain)
+	Object.assign(domainForm, saveDomainMailPreview({
+		...domainForm,
+		...(savedDomainData.settings || {}),
+		domains: savedRoutes.map((item) => item.domain),
+		routes: savedRoutes,
+		active_domain: activeDomain,
+	}))
+	for (const domain of Object.keys(domainIMAPPasswords)) delete domainIMAPPasswords[domain]
     Object.assign(runtime.value, data.runtime || {})
     runtime.value.api_configured = Boolean(String(form.public_api_key || '').trim() || runtime.value.config_api_key_configured)
     runtime.value.api_key_source = String(form.public_api_key || '').trim() ? 'system_settings' : (runtime.value.config_api_key_configured ? 'config' : '')
     notify('系统设置已保存')
   } catch (err) { notify(err.message, true) } finally { saving.value = '' }
 }
+
+async function selectDomainAccount(accountID) {
+  const selectedID = String(accountID || '')
+  if (!selectedID) return
+  const selectedOption = appleAccountOptions.value.find((item) => String(item.value) === selectedID)
+  if (selectedOption?.receiverEmail) domainForm.forward_to_email = String(selectedOption.receiverEmail).trim().toLowerCase()
+  try {
+    const data = await api(`/api/apple-accounts/${encodeURIComponent(selectedID)}`)
+    const account = data.account || {}
+    if (String(domainForm.account_id || '') !== selectedID) return
+    const receiverEmail = String(account.imap_email || account.apple_id || '').trim().toLowerCase()
+    if (selectedOption && receiverEmail) selectedOption.receiverEmail = receiverEmail
+    domainForm.forward_to_email = receiverEmail
+  } catch {
+    return
+  }
+}
+
+watch(() => domainForm.account_id, (accountID, previousID) => {
+	if (loading.value) return
+  if (String(accountID || '') !== String(previousID || '')) selectDomainAccount(accountID)
+})
 
 async function testServerChan() {
   if (saving.value) return
@@ -276,6 +511,43 @@ onBeforeUnmount(() => {
               <span class="settings-capability-option-copy"><strong>Apple 登录态保活</strong><small>基础 {{ Math.round((runtime.apple_keep_alive_ms || 180000) / 60000) }} 分钟；每 30 秒扫描并在每轮重新随机 ±{{ runtime.apple_keep_alive_jitter_percent ?? 15 }}%</small></span>
               <input v-model="form.enable_apple_keep_alive" class="detail-switch" type="checkbox" :disabled="!runtime.apple_keep_alive_available" />
             </label>
+          </div>
+        </section>
+        <section id="domain-mail-settings" class="settings-domain-mail scroll-mt-20">
+          <div class="domain-receiver-card">
+            <header class="domain-receiver-heading">
+              <div class="domain-receiver-title">
+                <span><AtSign :size="18" /></span>
+                <div><div><h3>域名邮箱接收</h3><em>SQLite</em></div><p>接收邮箱可为 iCloud、Gmail、Outlook 或其他标准 IMAP 邮箱。</p></div>
+              </div>
+              <label class="domain-receiver-master"><span><strong>启用接收</strong><small>{{ domainForm.enabled ? '域名路由参与收信' : '仅保留配置' }}</small></span><input v-model="domainForm.enabled" class="detail-switch" type="checkbox" /></label>
+            </header>
+            <div class="domain-receiver-body">
+              <div class="domain-receiver-fields">
+                <div class="form-group domain-domain-editor"><span class="form-label">接收域名</span><span class="domain-domain-entry"><span class="field-wrap"><AtSign :size="15" class="field-icon" /><input v-model.trim="domainDraft" class="field field-leading" type="text" inputmode="url" autocomplete="off" spellcheck="false" placeholder="输入域名后回车" :disabled="!domainForm.enabled" @keydown.enter.prevent="addDomains" /></span><button type="button" :disabled="!domainForm.enabled || !domainDraft" title="添加接收域名" @click="addDomains"><Plus :size="14" /></button></span><span v-if="domainList.length" class="domain-domain-tags"><button v-for="domain in domainList" :key="domain" type="button" :class="{ 'is-active': domainForm.active_domain === domain }" :title="`切换到 @${domain} 的接收配置；点击右侧关闭图标删除`" :disabled="!domainForm.enabled" @click="selectDomainRoute(domain)"><span>@{{ domain }}</span><X :size="11" role="button" :aria-label="`删除接收域名 ${domain}`" @click.stop="removeDomain(domain)" /></button></span><small v-else class="domain-domain-empty">可添加多个，用逗号、空格分隔。</small></div>
+                <label class="form-group"><span class="form-label">收件通道</span><CardSelect v-model="domainForm.receiver_type" :options="domainReceiverOptions" aria-label="域名邮箱收件通道" :disabled="!domainForm.enabled" /></label>
+                <label v-if="domainForm.receiver_type === 'apple_account'" class="form-group"><span class="form-label">iCloud IMAP 账号</span><CardSelect v-model="domainForm.account_id" :options="appleAccountOptions" placeholder="选择已配置 IMAP 的账号" aria-label="iCloud IMAP 账号" :disabled="!domainForm.enabled" /></label>
+                <label v-else class="form-group"><span class="form-label">通道名称</span><input v-model.trim="domainForm.receiver_label" class="field" type="text" maxlength="80" placeholder="例如 Gmail 收件箱" :disabled="!domainForm.enabled" /></label>
+                <label class="form-group"><span class="form-label">接收邮箱</span><span class="field-wrap"><Mail :size="15" class="field-icon" /><input :value="domainReceiverEmail" class="field field-leading" type="email" autocomplete="email" spellcheck="false" placeholder="receiver@example.com" :disabled="!domainForm.enabled" :title="domainForm.receiver_type === 'apple_account' ? '可填写所选 Apple 账号的主号或已有隐私邮箱' : '填写标准 IMAP 实际接收邮件的邮箱'" @input="domainReceiverEmail = $event.target.value" /></span></label>
+                <label class="form-group"><span class="form-label">接收模式</span><CardSelect v-model="domainForm.match_mode" :options="domainModeOptions" aria-label="域名邮箱接收模式" :disabled="!domainForm.enabled" /></label>
+              </div>
+              <div class="domain-receiver-imap-fields" :class="domainForm.receiver_type === 'custom_imap' && domainForm.enabled ? 'is-enabled' : 'is-disabled'">
+                <div class="domain-imap-fields-heading"><span><strong>标准 IMAP 参数</strong><small>{{ domainForm.receiver_type === 'custom_imap' ? '已选择配置标准 IMAP，可直接填写。' : '选择“配置标准 IMAP”后可填写。' }}</small></span></div>
+                <label class="form-group"><span class="form-label">IMAP 主机</span><input v-model.trim="domainForm.imap_host" class="field font-mono" type="text" autocomplete="off" spellcheck="false" placeholder="imap.example.com" :disabled="!domainForm.enabled || domainForm.receiver_type !== 'custom_imap'" /></label>
+                <label class="form-group"><span class="form-label">端口</span><input v-model.number="domainForm.imap_port" class="field font-mono" type="number" min="1" max="65535" inputmode="numeric" :disabled="!domainForm.enabled || domainForm.receiver_type !== 'custom_imap'" /></label>
+                <label class="form-group"><span class="form-label">IMAP 用户名</span><input v-model.trim="domainForm.imap_username" class="field font-mono" type="text" autocomplete="username" spellcheck="false" placeholder="receiver@example.com" :disabled="!domainForm.enabled || domainForm.receiver_type !== 'custom_imap'" /></label>
+                <label class="form-group"><span class="form-label">IMAP 密码或专用密码</span><span class="field-wrap"><KeyRound :size="15" class="field-icon" /><input v-model="domainIMAPPassword" class="field field-leading field-trailing font-mono" :type="showDomainIMAPPassword ? 'text' : 'password'" autocomplete="new-password" :placeholder="domainForm.imap_password_configured ? '已加密保存，留空保持不变' : '输入密码或专用密码'" :disabled="!domainForm.enabled || domainForm.receiver_type !== 'custom_imap'" /><button type="button" class="domain-imap-password-toggle" :title="showDomainIMAPPassword ? '隐藏 IMAP 密码' : '显示 IMAP 密码'" :disabled="!domainForm.enabled || domainForm.receiver_type !== 'custom_imap'" @click="showDomainIMAPPassword = !showDomainIMAPPassword"><EyeOff v-if="showDomainIMAPPassword" :size="15" /><Eye v-else :size="15" /></button></span></label>
+                <label class="domain-imap-tls"><span><ShieldCheck :size="15" /><span><strong>TLS 加密连接</strong><small>标准 IMAPS 通常使用 993 端口。</small></span></span><input v-model="domainForm.imap_tls" class="detail-switch" type="checkbox" :disabled="!domainForm.enabled || domainForm.receiver_type !== 'custom_imap'" /></label>
+              </div>
+              <div class="domain-receiver-options">
+                <label class="settings-capability-option"><span class="settings-capability-option-icon"><Inbox :size="16" /></span><span class="settings-capability-option-copy"><strong>自动发现新地址</strong><small>首次收到邮件时建立本地邮箱。</small></span><input v-model="domainForm.auto_discover" class="detail-switch" type="checkbox" :disabled="!domainForm.enabled || domainForm.match_mode !== 'catch_all'" /></label>
+                <label class="settings-capability-option"><span class="settings-capability-option-icon"><KeyRound :size="16" /></span><span class="settings-capability-option-copy"><strong>新邮箱公共取码</strong><small>自动发现后允许获取验证码与邮件。</small></span><input v-model="domainForm.default_api_active" class="detail-switch" type="checkbox" :disabled="!domainForm.enabled" /></label>
+              </div>
+            </div>
+            <footer class="domain-receiver-footer">
+              <span><i :class="domainRouteReady ? 'is-ready' : ''" /><span><strong :title="domainRouteText">{{ domainRouteText }}</strong><small>{{ domainReceiverText }}；配置保存到 SQLite，IMAP 密码加密存储。</small></span></span>
+              <RouterLink :to="{ name: 'domain-mailboxes' }">打开域名邮箱<ArrowRight :size="13" /></RouterLink>
+            </footer>
           </div>
         </section>
         <section class="settings-web-api">

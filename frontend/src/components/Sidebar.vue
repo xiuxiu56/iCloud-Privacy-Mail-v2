@@ -1,6 +1,6 @@
 <script setup>
 import { computed } from 'vue'
-import { Activity, Apple, Boxes, ChevronRight, Cloud, Download, LayoutDashboard, MailPlus, Settings, X } from '@lucide/vue'
+import { Activity, Apple, AtSign, Boxes, ChevronRight, Cloud, Download, LayoutDashboard, MailPlus, Settings, X } from '@lucide/vue'
 import ThemeToggle from './ThemeToggle.vue'
 import { useUpdates } from '../composables/useUpdates'
 
@@ -25,6 +25,7 @@ const items = [
   { name: 'dashboard', label: '控制台', icon: LayoutDashboard },
   { name: 'apple-accounts', label: 'Apple 账号', icon: Apple },
   { name: 'mailboxes', label: '邮箱池', icon: Boxes },
+  { name: 'domain-mailboxes', label: '域名邮箱', icon: AtSign },
   { name: 'tasks', label: '创建隐私邮箱', icon: MailPlus },
   { name: 'exports', label: '本地导出', icon: Download },
   { name: 'settings', label: '系统设置', icon: Settings },

@@ -17,24 +17,32 @@ import (
 )
 
 type fakeMessageSyncBackend struct {
-	mu          sync.Mutex
-	imapCalls   int
-	webCalls    int
-	activeCalls int
-	maxActive   int
-	delay       time.Duration
-	imapResult  protocol.MailSyncBatchResult
-	webResult   protocol.MailSyncBatchResult
-	imapErr     error
-	webErr      error
-	imapOptions []protocol.MailSyncOptions
-	webOptions  []protocol.MailSyncOptions
+	mu           sync.Mutex
+	imapCalls    int
+	webCalls     int
+	activeCalls  int
+	maxActive    int
+	delay        time.Duration
+	imapResult   protocol.MailSyncBatchResult
+	webResult    protocol.MailSyncBatchResult
+	imapErr      error
+	webErr       error
+	imapOptions  []protocol.MailSyncOptions
+	webOptions   []protocol.MailSyncOptions
+	imapKinds    [][]string
+	imapFetched  map[string]protocol.ICloudSyncedMessage
+	imapFetchErr error
 }
 
-func (backend *fakeMessageSyncBackend) SyncIMAP(ctx context.Context, _ protocol.LoginState, _ []domain.Mailbox, options protocol.MailSyncOptions) (protocol.MailSyncBatchResult, error) {
+func (backend *fakeMessageSyncBackend) SyncIMAP(ctx context.Context, _ protocol.LoginState, mailboxes []domain.Mailbox, options protocol.MailSyncOptions) (protocol.MailSyncBatchResult, error) {
 	backend.beginCall(true)
 	backend.mu.Lock()
 	backend.imapOptions = append(backend.imapOptions, options)
+	kinds := make([]string, 0, len(mailboxes))
+	for _, mailbox := range mailboxes {
+		kinds = append(kinds, mailboxKind(mailbox))
+	}
+	backend.imapKinds = append(backend.imapKinds, kinds)
 	backend.mu.Unlock()
 	defer backend.endCall()
 	if err := backend.wait(ctx); err != nil {
@@ -53,6 +61,22 @@ func (backend *fakeMessageSyncBackend) SyncWeb(ctx context.Context, _ protocol.I
 		return protocol.MailSyncBatchResult{}, err
 	}
 	return backend.webResult, backend.webErr
+}
+
+func (backend *fakeMessageSyncBackend) FetchIMAP(ctx context.Context, _ protocol.LoginState, uids []string) (map[string]protocol.ICloudSyncedMessage, error) {
+	if err := backend.wait(ctx); err != nil {
+		return nil, err
+	}
+	if backend.imapFetchErr != nil {
+		return nil, backend.imapFetchErr
+	}
+	out := make(map[string]protocol.ICloudSyncedMessage)
+	for _, uid := range uids {
+		if message, found := backend.imapFetched[uid]; found {
+			out[uid] = message
+		}
+	}
+	return out, nil
 }
 
 func (backend *fakeMessageSyncBackend) beginCall(imap bool) {
@@ -106,6 +130,15 @@ func (backend *fakeMessageSyncBackend) latestOptions() (protocol.MailSyncOptions
 		webOptions = backend.webOptions[len(backend.webOptions)-1]
 	}
 	return imapOptions, webOptions
+}
+
+func (backend *fakeMessageSyncBackend) latestIMAPKinds() []string {
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	if len(backend.imapKinds) == 0 {
+		return nil
+	}
+	return append([]string(nil), backend.imapKinds[len(backend.imapKinds)-1]...)
 }
 
 func TestSyncExistingMailboxMessagesReturnsEmptyResult(t *testing.T) {
@@ -205,6 +238,33 @@ func TestCodeSyncUsesWebAPIWhenEnabled(t *testing.T) {
 	}
 }
 
+func TestCodeSyncUsesConcurrentDualPathWhenEnabled(t *testing.T) {
+	state := openSyncTestStore(t)
+	mailbox := saveSyncTestAccount(t, state, "code-concurrent@icloud.com", true)
+	settings := state.Settings()
+	settings.EnableWebCodeSync = true
+	if _, err := state.SaveSettings(settings); err != nil {
+		t.Fatalf("开启 Web API 即时取码失败：%v", err)
+	}
+	backend := &fakeMessageSyncBackend{
+		delay:      30 * time.Millisecond,
+		imapResult: protocol.MailSyncBatchResult{MessagesByMailbox: map[string][]protocol.ICloudSyncedMessage{}, LastUID: "42"},
+		webResult:  protocol.MailSyncBatchResult{MessagesByMailbox: map[string][]protocol.ICloudSyncedMessage{}},
+	}
+	service := NewService(config.Default(), state)
+	service.messageBackend = backend
+	if _, err := service.SyncMessages(context.Background(), mailbox.ID); err != nil {
+		t.Fatalf("双路即时取码失败：%v", err)
+	}
+	if imap, web, maxActive := backend.counts(); imap != 1 || web != 1 || maxActive != 2 {
+		t.Fatalf("即时取码未并发执行 IMAP 与 Web API：IMAP=%d Web=%d 最大并发=%d", imap, web, maxActive)
+	}
+	imapOptions, webOptions := backend.latestOptions()
+	if imapOptions.Mode != protocol.MailSyncModeAllRecent || webOptions.Mode != protocol.MailSyncModeAllRecent || !imapOptions.FullScan || !webOptions.FullScan {
+		t.Fatalf("第一个取码请求应先完成全部邮件初始化：IMAP=%+v Web=%+v", imapOptions, webOptions)
+	}
+}
+
 func TestManualSyncUsesOnlyIMAPWhenWebAPIDisabled(t *testing.T) {
 	state := openSyncTestStore(t)
 	mailbox := saveSyncTestAccount(t, state, "manual-imap-only@icloud.com", true)
@@ -247,8 +307,8 @@ func TestSyncExistingMailboxMessagesComplementsIMAPWithWeb(t *testing.T) {
 		t.Fatalf("手动同步应对每个账号各调用一次 IMAP 和 Web：IMAP=%d，Web=%d", imap, web)
 	}
 	imapOptions, webOptions := backend.latestOptions()
-	if !imapOptions.FullScan || !webOptions.FullScan || imapOptions.Limit != 0 || webOptions.Limit != 0 || imapOptions.UseCursor || webOptions.UseCursor {
-		t.Fatalf("批量同步应对两个路径执行无游标全量扫描：IMAP=%+v，Web=%+v", imapOptions, webOptions)
+	if !imapOptions.FullScan || !webOptions.FullScan || imapOptions.Limit != 0 || webOptions.Limit != 0 || !imapOptions.UseCursor || webOptions.UseCursor {
+		t.Fatalf("首次批量同步应并发执行 IMAP 全量和 Web 全量扫描：IMAP=%+v，Web=%+v", imapOptions, webOptions)
 	}
 }
 
@@ -267,8 +327,128 @@ func TestSyncMailboxMessagesUsesSharedDualPathForAllNewMail(t *testing.T) {
 		t.Fatalf("单邮箱同步未复用双路径：结果=%+v，错误=%v", result, err)
 	}
 	imapOptions, webOptions := backend.latestOptions()
-	if imapOptions.Mode != protocol.MailSyncModeAllRecent || webOptions.Mode != protocol.MailSyncModeAllRecent || !imapOptions.UseCursor || !webOptions.UseCursor || imapOptions.FullScan || webOptions.FullScan {
+	if imapOptions.Mode != protocol.MailSyncModeAllRecent || webOptions.Mode != protocol.MailSyncModeAllRecent || !imapOptions.UseCursor || webOptions.UseCursor || !imapOptions.FullScan || !webOptions.FullScan || imapOptions.Limit != 0 || webOptions.Limit != 0 {
 		t.Fatalf("单邮箱同步参数不正确：IMAP=%+v，Web=%+v", imapOptions, webOptions)
+	}
+}
+
+func TestMailboxSyncUsesSavedScopeCursorAfterFirstFullScan(t *testing.T) {
+	state := openSyncTestStore(t)
+	mailbox := saveSyncTestAccount(t, state, "cursor@icloud.com", true)
+	backend := &fakeMessageSyncBackend{
+		imapResult: protocol.MailSyncBatchResult{MessagesByMailbox: map[string][]protocol.ICloudSyncedMessage{}, UIDValidity: "3857529045", LastUID: "1211", Scanned: 134},
+		webResult:  protocol.MailSyncBatchResult{MessagesByMailbox: map[string][]protocol.ICloudSyncedMessage{}},
+	}
+	service := NewService(config.Default(), state)
+	service.messageBackend = backend
+
+	if _, err := service.SyncMailboxMessages(context.Background(), mailbox.ID); err != nil {
+		t.Fatalf("首次全量同步失败：%v", err)
+	}
+	backend.imapResult = protocol.MailSyncBatchResult{MessagesByMailbox: map[string][]protocol.ICloudSyncedMessage{}, UIDValidity: "3857529045", LastUID: "1211"}
+	if _, err := service.SyncMailboxMessages(context.Background(), mailbox.ID); err != nil {
+		t.Fatalf("第二次增量同步失败：%v", err)
+	}
+	imapOptions, webOptions := backend.latestOptions()
+	if imapOptions.FullScan || !imapOptions.UseCursor || imapOptions.CursorUID != "1211" || imapOptions.CursorUIDValidity != "3857529045" {
+		t.Fatalf("第二次 IMAP 未从持久化 LastUID 继续：%+v", imapOptions)
+	}
+	if webOptions.FullScan || !webOptions.UseCursor {
+		t.Fatalf("第二次 Web 补查应进入增量模式：%+v", webOptions)
+	}
+	var cursor MailSyncState
+	if found, err := state.LoadRuntimeState(mailSyncStateID(mailbox.AccountID, "imap", "source"), &cursor); err != nil || !found || cursor.LastScannedUID != "1211" || cursor.UIDValidity != "3857529045" || !cursor.HistoryComplete {
+		t.Fatalf("邮箱池游标保存不正确：found=%t cursor=%+v err=%v", found, cursor, err)
+	}
+}
+
+func TestDualPathManualSyncRunsConcurrently(t *testing.T) {
+	state := openSyncTestStore(t)
+	mailbox := saveSyncTestAccount(t, state, "concurrent@icloud.com", true)
+	backend := &fakeMessageSyncBackend{
+		delay:      40 * time.Millisecond,
+		imapResult: protocol.MailSyncBatchResult{MessagesByMailbox: map[string][]protocol.ICloudSyncedMessage{}, LastUID: "42"},
+		webResult:  protocol.MailSyncBatchResult{MessagesByMailbox: map[string][]protocol.ICloudSyncedMessage{}},
+	}
+	service := NewService(config.Default(), state)
+	service.messageBackend = backend
+
+	if _, err := service.SyncMailboxMessages(context.Background(), mailbox.ID); err != nil {
+		t.Fatalf("双路并发同步失败：%v", err)
+	}
+	if imap, web, maxActive := backend.counts(); imap != 1 || web != 1 || maxActive != 2 {
+		t.Fatalf("IMAP 与 Web API 未并发执行：IMAP=%d Web=%d 最大并发=%d", imap, web, maxActive)
+	}
+}
+
+func TestICloudAndDomainMailboxesSharePhysicalInboxCursor(t *testing.T) {
+	state := openSyncTestStore(t)
+	icloudMailbox := saveSyncTestAccount(t, state, "scopes@icloud.com", true)
+	settings := domain.DefaultDomainMailSettings()
+	settings.Enabled = true
+	_, routes, err := state.SaveDomainMailConfig(settings, []domain.DomainMailRoute{{
+		Domain: "example.net", ReceiverType: domain.DomainReceiverAppleAccount,
+		AccountID: icloudMailbox.AccountID, ForwardToEmail: "scopes@icloud.com",
+	}})
+	if err != nil || len(routes) != 1 {
+		t.Fatalf("创建域名收件路由失败：routes=%+v err=%v", routes, err)
+	}
+	domainMailboxes, err := state.CreateDomainMailboxes(routes[0].ID, []string{"code@example.net"}, "域名邮箱", "", true)
+	if err != nil || len(domainMailboxes) != 1 {
+		t.Fatalf("创建域名邮箱失败：mailboxes=%+v err=%v", domainMailboxes, err)
+	}
+	backend := &fakeMessageSyncBackend{
+		imapResult: protocol.MailSyncBatchResult{MessagesByMailbox: map[string][]protocol.ICloudSyncedMessage{}, UIDValidity: "validity-1", LastUID: "100"},
+		webResult:  protocol.MailSyncBatchResult{MessagesByMailbox: map[string][]protocol.ICloudSyncedMessage{}},
+	}
+	service := NewService(config.Default(), state)
+	service.messageBackend = backend
+
+	if _, err := service.SyncMailboxMessages(context.Background(), icloudMailbox.ID); err != nil {
+		t.Fatalf("邮箱池首次同步失败：%v", err)
+	}
+	backend.imapResult = protocol.MailSyncBatchResult{MessagesByMailbox: map[string][]protocol.ICloudSyncedMessage{}, UIDValidity: "validity-1", LastUID: "200"}
+	if _, err := service.SyncMailboxMessages(context.Background(), domainMailboxes[0].ID); err != nil {
+		t.Fatalf("域名邮箱首次同步失败：%v", err)
+	}
+	domainOptions, _ := backend.latestOptions()
+	if domainOptions.FullScan || domainOptions.CursorUID != "100" || domainOptions.CursorUIDValidity != "validity-1" {
+		t.Fatalf("同一收件箱的域名邮箱应复用账号级游标：%+v", domainOptions)
+	}
+	if kinds := backend.latestIMAPKinds(); len(kinds) != 2 {
+		t.Fatalf("同一收件箱的 iCloud 与域名邮箱应共用一次扫描：kinds=%v", kinds)
+	}
+
+	var sourceCursor MailSyncState
+	found, loadErr := state.LoadRuntimeState(mailSyncStateID(icloudMailbox.AccountID, "imap", "source"), &sourceCursor)
+	if !found || loadErr != nil || sourceCursor.LastScannedUID != "200" {
+		t.Fatalf("共用收件箱游标不正确：found=%t cursor=%+v err=%v", found, sourceCursor, loadErr)
+	}
+}
+
+func TestSingleMailboxSyncOnlyTouchesSelectedRowWithoutNewMessages(t *testing.T) {
+	state := openSyncTestStore(t)
+	selected := saveSyncTestAccount(t, state, "touch@icloud.com", true)
+	other, _, err := state.UpsertMailboxFromRemote(selected.AccountID, domain.RemoteMailbox{Email: "other@icloud.com", IsActive: true}, "")
+	if err != nil {
+		t.Fatalf("创建同账号第二个邮箱失败：%v", err)
+	}
+	backend := &fakeMessageSyncBackend{
+		imapResult: protocol.MailSyncBatchResult{MessagesByMailbox: map[string][]protocol.ICloudSyncedMessage{}, LastUID: "55"},
+		webResult:  protocol.MailSyncBatchResult{MessagesByMailbox: map[string][]protocol.ICloudSyncedMessage{}},
+	}
+	service := NewService(config.Default(), state)
+	service.messageBackend = backend
+	if _, err := service.SyncMailboxMessages(context.Background(), selected.ID); err != nil {
+		t.Fatalf("单行同步失败：%v", err)
+	}
+	selectedAfter, _ := state.FindMailboxByID(selected.ID)
+	otherAfter, _ := state.FindMailboxByID(other.ID)
+	if selectedAfter.LastSyncAt.IsZero() || selectedAfter.LastSyncUID != "55" {
+		t.Fatalf("选中邮箱未保存同步时间与 UID：%+v", selectedAfter)
+	}
+	if !otherAfter.LastSyncAt.IsZero() || otherAfter.LastSyncUID != "" {
+		t.Fatalf("单行同步不应改动其他邮箱的同步时间：%+v", otherAfter)
 	}
 }
 
@@ -285,6 +465,10 @@ func TestManualMailboxSyncReportsWebComplementFailure(t *testing.T) {
 	result, err := service.SyncMailboxMessages(context.Background(), mailbox.ID)
 	if err == nil || !strings.Contains(err.Error(), "Web 补查测试故障") || result.IMAPAccounts != 1 || result.WebAPIAccounts != 0 {
 		t.Fatalf("手动同步应报告 Web 补查失败并保留 IMAP 结果：结果=%+v，错误=%v", result, err)
+	}
+	var cursor MailSyncState
+	if found, loadErr := state.LoadRuntimeState(mailSyncStateID(mailbox.AccountID, "imap", "source"), &cursor); loadErr != nil || !found {
+		t.Fatalf("IMAP 已完成时应独立推进游标：found=%t cursor=%+v err=%v", found, cursor, loadErr)
 	}
 }
 
@@ -442,6 +626,73 @@ func TestSummarizeExistingMailboxMessageSyncErrorRemovesLongResponse(t *testing.
 	message := `iCloud 邮件 /mailws2/v1/thread/search HTTP 400：{"status":400,"message":"Validation failed for argument at index 0"}`
 	if summary := summarizeExistingMailboxMessageSyncError(message); summary != "iCloud Web 补查请求参数被拒绝（HTTP 400）" {
 		t.Fatalf("邮件同步错误摘要不正确：%s", summary)
+	}
+}
+
+func TestNewMailboxUsesSharedIndexForHistoricalMail(t *testing.T) {
+	state := openSyncTestStore(t)
+	existing := saveSyncTestAccount(t, state, "history-index@icloud.com", true)
+	backend := &fakeMessageSyncBackend{imapResult: protocol.MailSyncBatchResult{
+		MessagesByMailbox: map[string][]protocol.ICloudSyncedMessage{}, UIDValidity: "validity-history", LastUID: "100", Scanned: 100,
+		IndexEntries: []protocol.MailIndexEntry{{
+			UID: "50", RemoteID: "imap:50", RemoteIDs: []string{"imap:50"}, CanonicalID: "message-id:history@example.com",
+			Recipients: []string{"late@icloud.com"}, Source: "imap", Subject: "历史验证码", From: "sender@example.com",
+			ReceivedAt: time.Date(2026, 8, 1, 8, 0, 0, 0, time.UTC),
+		}},
+	}}
+	service := NewService(config.Default(), state)
+	service.messageBackend = backend
+	if _, err := service.SyncMailboxMessages(context.Background(), existing.ID); err != nil {
+		t.Fatalf("初始化账号邮件索引失败：%v", err)
+	}
+
+	late, _, err := state.UpsertMailboxFromRemote(existing.AccountID, domain.RemoteMailbox{Email: "late@icloud.com", IsActive: true}, "")
+	if err != nil {
+		t.Fatalf("创建后加入的邮箱失败：%v", err)
+	}
+	receivedAt := time.Date(2026, 8, 1, 8, 0, 0, 0, time.UTC)
+	backend.imapResult = protocol.MailSyncBatchResult{MessagesByMailbox: map[string][]protocol.ICloudSyncedMessage{}, UIDValidity: "validity-history", LastUID: "100"}
+	backend.imapFetched = map[string]protocol.ICloudSyncedMessage{"50": {
+		UID: "50", RemoteID: "imap:50", RemoteIDs: []string{"imap:50"}, CanonicalID: "message-id:history@example.com",
+		Source: "imap", Subject: "历史验证码", From: "sender@example.com", Body: "验证码 123456", ContentType: "text/plain",
+		ReceivedAt: receivedAt, Recipients: []string{"late@icloud.com"},
+	}}
+	result, err := service.SyncMailboxMessages(context.Background(), late.ID)
+	if err != nil || result.SyncedMessages != 1 {
+		t.Fatalf("后加入邮箱未从共享索引补全历史邮件：结果=%+v 错误=%v", result, err)
+	}
+	if messages := state.MessagesForMailbox(late.ID); len(messages) != 1 || messages[0].Body != "验证码 123456" {
+		t.Fatalf("后加入邮箱的历史正文不正确：%+v", messages)
+	}
+	imapOptions, _ := backend.latestOptions()
+	if imapOptions.FullScan || imapOptions.CursorUID != "100" {
+		t.Fatalf("已有完整索引时不应重新扫描全部邮件：%+v", imapOptions)
+	}
+	histories := state.MailboxHistoryStates([]string{late.ID})
+	if history := histories[late.ID]; !history.Complete || history.HistoryThroughUID != "100" {
+		t.Fatalf("后加入邮箱历史状态未完成：%+v", history)
+	}
+}
+
+func TestMailReconcileDueUsesPersistedTime(t *testing.T) {
+	state := openSyncTestStore(t)
+	service := NewService(config.Default(), state)
+	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	if !service.MailReconcileDue("account-reconcile", now) {
+		t.Fatal("尚未建立索引的收件账号应执行对账")
+	}
+	stateID := mailSyncStateID("account-reconcile", "imap", "source")
+	if err := state.SaveRuntimeState(stateID, MailSyncState{
+		AccountID: "account-reconcile", Method: "imap", Folder: "INBOX", HistoryComplete: true,
+		LastFullScanAt: now.Add(-48 * time.Hour), LastReconcileAt: now.Add(-23 * time.Hour),
+	}, false); err != nil {
+		t.Fatalf("保存对账状态失败：%v", err)
+	}
+	if service.MailReconcileDue("account-reconcile", now) {
+		t.Fatal("24 小时内已对账的收件账号不应重复扫描")
+	}
+	if !service.MailReconcileDue("account-reconcile", now.Add(2*time.Hour)) {
+		t.Fatal("超过 24 小时后应自动对账")
 	}
 }
 

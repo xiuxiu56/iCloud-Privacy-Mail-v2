@@ -40,6 +40,14 @@ func TestSetMailboxStatusHandlesOptionalNote(t *testing.T) {
 		t.Fatalf("仅更新状态时备注发生变化：%q", updated.Note)
 	}
 
+	updated, err = state.SetMailboxStatus(mailbox.ID, nil, nil, domain.StatusReserved, nil)
+	if err != nil {
+		t.Fatalf("手动设置已预留状态失败：%v", err)
+	}
+	if updated.Status != domain.StatusReserved || updated.ActiveLeaseID != "" {
+		t.Fatalf("手动设置的已预留状态不正确：%+v", updated)
+	}
+
 	emptyNote := ""
 	updated, err = state.SetMailboxStatus(mailbox.ID, nil, nil, "", &emptyNote)
 	if err != nil {

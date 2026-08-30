@@ -21,6 +21,8 @@ import (
 	"time"
 )
 
+var recipientEmailPattern = regexp.MustCompile(`[A-Za-z0-9.!#$%&'*+/=?^_{}|~\-]+@[A-Za-z0-9](?:[A-Za-z0-9.\-]{0,251}[A-Za-z0-9])?`)
+
 type ICloudClient struct {
 	client *http.Client
 }
@@ -47,6 +49,7 @@ type ICloudSyncedMessage struct {
 	HTMLBody    string
 	ContentType string
 	ReceivedAt  time.Time
+	Recipients  []string
 }
 
 type ICloudMailCleanupResult struct {
@@ -56,6 +59,11 @@ type ICloudMailCleanupResult struct {
 	LocalRemoved    int      `json:"local_removed"`
 	MovedRemoteIDs  []string `json:"-"`
 	AbsentRemoteIDs []string `json:"-"`
+}
+
+type ICloudRemoteMessageDiscoveryResult struct {
+	RemoteIDsByMailbox map[string][]string
+	ThreadsScanned     int
 }
 
 type ICloudAllMailCleanupResult struct {
@@ -76,6 +84,7 @@ func NewICloudClient() *ICloudClient {
 }
 
 const mailboxSyncCursorOverlap = 2 * time.Minute
+const iCloudMailDeleteClientIntent = "deleteMessagesGems"
 const appleAccountManageRefreshSkew = 0 * time.Second
 const appleAccountKeepAliveDefaultInterval = 4 * time.Minute
 const appleAccountKeepAliveTimeout = 25 * time.Second
@@ -1420,6 +1429,7 @@ func (c *ICloudClient) SyncMailboxMessagesBatchWithOptions(ctx context.Context, 
 	}
 	folders = preferredMailFolders(folders)
 	out := make(map[string][]ICloudSyncedMessage, len(aliases))
+	discovered := make(map[string][]ICloudSyncedMessage)
 	scanned := 0
 	hasMore := false
 	seenThreads := make(map[string]bool)
@@ -1446,12 +1456,15 @@ func (c *ICloudClient) SyncMailboxMessagesBatchWithOptions(ctx context.Context, 
 			if options.VerificationOnly() && !looksLikeVerificationText(text, keyword) {
 				continue
 			}
-			messagesByMailbox, err := c.threadMessagesForAliases(ctx, session, folder, threadID, aliases, afterByMailbox)
+			messagesByMailbox, discoveredByEmail, err := c.threadMessagesForAliasesWithDiscovery(ctx, session, folder, threadID, aliases, afterByMailbox, options.DiscoveryDomains)
 			if err != nil {
 				return MailSyncBatchResult{MessagesByMailbox: out, Scanned: scanned, Matched: countMatchedMessages(out)}, err
 			}
 			for mailboxID, messages := range messagesByMailbox {
 				out[mailboxID] = append(out[mailboxID], messages...)
+			}
+			for email, messages := range discoveredByEmail {
+				discovered[email] = append(discovered[email], messages...)
 			}
 		}
 	}
@@ -1460,7 +1473,80 @@ func (c *ICloudClient) SyncMailboxMessagesBatchWithOptions(ctx context.Context, 
 			return out[mailboxID][i].ReceivedAt.After(out[mailboxID][j].ReceivedAt)
 		})
 	}
-	return MailSyncBatchResult{MessagesByMailbox: out, Scanned: scanned, Matched: countMatchedMessages(out), HasMore: hasMore}, nil
+	result := MailSyncBatchResult{MessagesByMailbox: out, DiscoveredByEmail: discovered, Scanned: scanned, HasMore: hasMore}
+	result.Matched = countMailSyncMatches(result)
+	return result, nil
+}
+
+// FindRemoteMessageIDsByMailbox 按收件地址查找 iCloud 主号中的云端邮件。
+// 域名邮箱只是本地登记地址，不是 Apple 服务器上的隐私邮箱对象。
+func (c *ICloudClient) FindRemoteMessageIDsByMailbox(ctx context.Context, session ICloudSession, mailboxes []Mailbox) (ICloudRemoteMessageDiscoveryResult, error) {
+	session = normalizeICloudWebSession(session)
+	result := ICloudRemoteMessageDiscoveryResult{RemoteIDsByMailbox: make(map[string][]string)}
+	if strings.TrimSpace(session.DSID) == "" || len(session.Cookies) == 0 {
+		return result, errCode("icloud_session_missing", "未保存 iCloud 登录态，请先协议登录", true)
+	}
+	aliases := make(map[string]string)
+	for _, mailbox := range mailboxes {
+		mailboxID := strings.TrimSpace(mailbox.ID)
+		email := strings.ToLower(strings.TrimSpace(mailbox.Email))
+		if mailboxID != "" && email != "" {
+			aliases[mailboxID] = email
+		}
+	}
+	if len(aliases) == 0 {
+		return result, nil
+	}
+
+	folders, err := c.mailFolders(ctx, session)
+	if err != nil {
+		return result, err
+	}
+	trash, hasTrash := trashMailFolder(folders)
+	folders = preferredMailFolders(folders)
+	if hasTrash {
+		trashIncluded := false
+		for _, folder := range folders {
+			if strings.TrimSpace(folder.ID) != "" && folder.ID == trash.ID {
+				trashIncluded = true
+				break
+			}
+		}
+		if !trashIncluded {
+			folders = append(folders, trash)
+		}
+	}
+	seenThreads := make(map[string]bool)
+	for _, folder := range folders {
+		const maxThreads = 1000
+		threads, err := c.searchThreadsWithOptions(ctx, session, folder, maxThreads, true)
+		if err != nil {
+			return result, err
+		}
+		if len(threads) >= maxThreads {
+			return result, errCode("icloud_remote_scan_incomplete", "iCloud 云端单个文件夹返回了 1000 个邮件线程，为避免遗漏邮件，本次未继续删除", true)
+		}
+		for _, thread := range threads {
+			threadID := strings.TrimSpace(thread.ThreadID)
+			threadKey := firstNonEmpty(strings.TrimSpace(folder.ID), strings.TrimSpace(folder.Name)) + "\x00" + threadID
+			if threadID == "" || seenThreads[threadKey] {
+				continue
+			}
+			seenThreads[threadKey] = true
+			result.ThreadsScanned++
+			matches, err := c.threadRemoteMessageIDsByMailbox(ctx, session, folder, threadID, aliases)
+			if err != nil {
+				return result, err
+			}
+			for mailboxID, remoteIDs := range matches {
+				result.RemoteIDsByMailbox[mailboxID] = append(result.RemoteIDsByMailbox[mailboxID], remoteIDs...)
+			}
+		}
+	}
+	for mailboxID, remoteIDs := range result.RemoteIDsByMailbox {
+		result.RemoteIDsByMailbox[mailboxID] = uniqueStrings(remoteIDs)
+	}
+	return result, nil
 }
 
 func mailThreadSearchLimit(folder mailFolder, options MailSyncOptions) int {
@@ -1695,6 +1781,44 @@ func (c *ICloudClient) threadMessages(ctx context.Context, session ICloudSession
 }
 
 func (c *ICloudClient) threadMessagesForAliases(ctx context.Context, session ICloudSession, folder mailFolder, threadID string, aliases map[string]string, afterByMailbox map[string]time.Time) (map[string][]ICloudSyncedMessage, error) {
+	messages, _, err := c.threadMessagesForAliasesWithDiscovery(ctx, session, folder, threadID, aliases, afterByMailbox, nil)
+	return messages, err
+}
+
+func (c *ICloudClient) threadRemoteMessageIDsByMailbox(ctx context.Context, session ICloudSession, folder mailFolder, threadID string, aliases map[string]string) (map[string][]string, error) {
+	var out struct {
+		MessageMetadataList []struct {
+			UID    json.RawMessage `json:"uid"`
+			Folder string          `json:"folder"`
+			To     json.RawMessage `json:"to"`
+			CC     json.RawMessage `json:"cc"`
+			BCC    json.RawMessage `json:"bcc"`
+		} `json:"messageMetadataList"`
+	}
+	body := map[string]any{
+		"threadId":       threadID,
+		"sessionHeaders": mailSessionHeaders(folder.Name, false),
+	}
+	if err := c.callMail(ctx, session, "/mailws2/v1/thread/get", body, "", &out); err != nil {
+		return nil, err
+	}
+	matches := make(map[string][]string)
+	for _, meta := range out.MessageMetadataList {
+		uid := rawScalarString(meta.UID)
+		if uid == "" {
+			continue
+		}
+		folderName := firstNonEmpty(cleanMailFolder(meta.Folder), folder.Name)
+		remoteID := "icloud:" + folderName + ":" + uid
+		recipients := string(meta.To) + "\n" + string(meta.CC) + "\n" + string(meta.BCC)
+		for _, mailboxID := range matchingMailboxIDs(recipients, aliases) {
+			matches[mailboxID] = append(matches[mailboxID], remoteID)
+		}
+	}
+	return matches, nil
+}
+
+func (c *ICloudClient) threadMessagesForAliasesWithDiscovery(ctx context.Context, session ICloudSession, folder mailFolder, threadID string, aliases map[string]string, afterByMailbox map[string]time.Time, discoveryDomains []string) (map[string][]ICloudSyncedMessage, map[string][]ICloudSyncedMessage, error) {
 	var out struct {
 		MessageMetadataList []struct {
 			UID       json.RawMessage `json:"uid"`
@@ -1721,9 +1845,10 @@ func (c *ICloudClient) threadMessagesForAliases(ctx context.Context, session ICl
 		"sessionHeaders": mailSessionHeaders(folder.Name, false),
 	}
 	if err := c.callMail(ctx, session, "/mailws2/v1/thread/get", body, "", &out); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	messages := make(map[string][]ICloudSyncedMessage)
+	discovered := make(map[string][]ICloudSyncedMessage)
 	for _, meta := range out.MessageMetadataList {
 		uid := rawScalarString(meta.UID)
 		if uid == "" {
@@ -1734,7 +1859,8 @@ func (c *ICloudClient) threadMessagesForAliases(ctx context.Context, session ICl
 		from := addressSummary(meta.From)
 		recipients := string(meta.To) + "\n" + string(meta.CC) + "\n" + string(meta.BCC)
 		matchedMailboxIDs := matchingMailboxIDs(recipients, aliases)
-		if len(matchedMailboxIDs) == 0 {
+		discoveredEmails := matchingDiscoveredEmails(recipients, discoveryDomains, aliases)
+		if len(matchedMailboxIDs) == 0 && len(discoveredEmails) == 0 {
 			continue
 		}
 		bodyText := meta.Preview
@@ -1744,7 +1870,7 @@ func (c *ICloudClient) threadMessagesForAliases(ctx context.Context, session ICl
 		if len(textParts) > 0 {
 			detail, err := c.messageBody(ctx, session, folderName, uid, textParts)
 			if err != nil {
-				return messages, err
+				return messages, discovered, err
 			}
 			longHeader = detail.LongHeader
 			if strings.TrimSpace(detail.TextBody) != "" {
@@ -1779,8 +1905,11 @@ func (c *ICloudClient) threadMessagesForAliases(ctx context.Context, session ICl
 			}
 			messages[mailboxID] = append(messages[mailboxID], message)
 		}
+		for _, email := range discoveredEmails {
+			discovered[email] = append(discovered[email], message)
+		}
 	}
-	return messages, nil
+	return messages, discovered, nil
 }
 
 func mailHeaderValue(rawHeader, name string) string {
@@ -1811,6 +1940,36 @@ func matchingMailboxIDs(recipients string, aliases map[string]string) []string {
 	}
 	sort.Strings(ids)
 	return ids
+}
+
+func matchingDiscoveredEmails(recipients string, domains []string, aliases map[string]string) []string {
+	if len(domains) == 0 {
+		return nil
+	}
+	allowed := make(map[string]bool, len(domains))
+	for _, value := range domains {
+		value = strings.Trim(strings.ToLower(strings.TrimSpace(value)), "@.")
+		if value != "" {
+			allowed[value] = true
+		}
+	}
+	known := make(map[string]bool, len(aliases))
+	for _, value := range aliases {
+		known[strings.ToLower(strings.TrimSpace(value))] = true
+	}
+	seen := make(map[string]bool)
+	out := make([]string, 0)
+	for _, match := range recipientEmailPattern.FindAllString(recipients, -1) {
+		email := strings.ToLower(strings.Trim(match, `"'<>[](),;`))
+		separator := strings.LastIndexByte(email, '@')
+		if separator <= 0 || !allowed[email[separator+1:]] || known[email] || seen[email] {
+			continue
+		}
+		seen[email] = true
+		out = append(out, email)
+	}
+	sort.Strings(out)
+	return out
 }
 
 type mailMessageDetail struct {
@@ -1862,6 +2021,16 @@ func (c *ICloudClient) messageBody(ctx context.Context, session ICloudSession, f
 }
 
 func (c *ICloudClient) MoveRemoteMessagesToTrash(ctx context.Context, session ICloudSession, remoteIDs []string) (ICloudMailCleanupResult, error) {
+	return c.moveRemoteMessagesToTrash(ctx, session, remoteIDs, false)
+}
+
+// MoveRemoteMessagesToTrashAndDestroy 先将指定邮件移入废纸篓，再使用同一批邮件标识彻底删除。
+// 该方法不扫描或清空整个废纸篓。
+func (c *ICloudClient) MoveRemoteMessagesToTrashAndDestroy(ctx context.Context, session ICloudSession, remoteIDs []string) (ICloudMailCleanupResult, error) {
+	return c.moveRemoteMessagesToTrash(ctx, session, remoteIDs, true)
+}
+
+func (c *ICloudClient) moveRemoteMessagesToTrash(ctx context.Context, session ICloudSession, remoteIDs []string, destroy bool) (ICloudMailCleanupResult, error) {
 	session = normalizeICloudWebSession(session)
 	var result ICloudMailCleanupResult
 	if strings.TrimSpace(session.DSID) == "" || len(session.Cookies) == 0 {
@@ -1878,11 +2047,16 @@ func (c *ICloudClient) MoveRemoteMessagesToTrash(ctx context.Context, session IC
 
 	byFolder := make(map[string][]string)
 	imapUIDs := make([]string, 0)
+	trashUIDs := make([]string, 0)
 	for _, remoteID := range remoteIDs {
 		folderName, uid, ok := parseICloudRemoteID(remoteID)
 		if ok {
 			if strings.EqualFold(folderName, trash.Name) {
-				result.Skipped++
+				if destroy {
+					trashUIDs = append(trashUIDs, uid)
+				} else {
+					result.Skipped++
+				}
 				continue
 			}
 			byFolder[folderName] = append(byFolder[folderName], uid)
@@ -1953,15 +2127,155 @@ func (c *ICloudClient) MoveRemoteMessagesToTrash(ctx context.Context, session IC
 			absentRemoteIDs = append(absentRemoteIDs, "imap:"+uid)
 		}
 	}
+	alreadyInTrashIdentifiers := make([]string, 0, len(trashUIDs))
+	if len(trashUIDs) > 0 {
+		ids, err := c.mailMessageIdentifiers(ctx, session, trash, trashUIDs)
+		if err != nil {
+			return result, fmt.Errorf("定位 iCloud 废纸篓中的目标邮件失败：%w", err)
+		}
+		for _, uid := range uniqueStrings(trashUIDs) {
+			identifier := strings.TrimSpace(ids[uid])
+			remoteID := "icloud:" + trash.Name + ":" + uid
+			if identifier == "" {
+				absentRemoteIDs = append(absentRemoteIDs, remoteID)
+				continue
+			}
+			alreadyInTrashIdentifiers = append(alreadyInTrashIdentifiers, identifier)
+			movedRemoteIDs = append(movedRemoteIDs, remoteID)
+		}
+	}
 
+	var trashBefore map[string]bool
+	if destroy && (len(identifiers) > 0 || len(alreadyInTrashIdentifiers) > 0) {
+		messages, err := c.mailFolderMessagePage(ctx, session, trash, 1000)
+		if err != nil {
+			return result, fmt.Errorf("读取 iCloud 废纸篓失败：%w", err)
+		}
+		trashBefore = mailIdentifierSet(messages)
+	}
 	moved, err := c.moveMailIdentifiersToTrash(ctx, session, identifiers, trash.ID)
 	result.MovedToTrash += moved
 	if err != nil {
 		return result, err
 	}
+	if destroy {
+		movedTrashIdentifiers, err := c.waitForMovedMailIdentifiers(ctx, session, trash, identifiers, trashBefore)
+		if err != nil {
+			return result, err
+		}
+		trashIdentifiers := uniqueStrings(append(alreadyInTrashIdentifiers, movedTrashIdentifiers...))
+		destroyed, err := c.destroyMailIdentifiers(ctx, session, trashIdentifiers)
+		result.Destroyed += destroyed
+		if err != nil {
+			return result, fmt.Errorf("彻底删除已移入废纸篓的邮件失败：%w", err)
+		}
+		if err := c.waitForDestroyedMailIdentifiers(ctx, session, trash, trashIdentifiers); err != nil {
+			return result, err
+		}
+		// 以废纸篓二次确认为准，避免 Apple 返回空 destroyed 时误报成功数。
+		result.Destroyed = len(trashIdentifiers)
+	}
 	result.MovedRemoteIDs = uniqueStrings(movedRemoteIDs)
 	result.AbsentRemoteIDs = uniqueStrings(absentRemoteIDs)
 	return result, nil
+}
+
+func mailIdentifierSet(messages []mailEmailObject) map[string]bool {
+	out := make(map[string]bool, len(messages))
+	for _, message := range messages {
+		if identifier := strings.TrimSpace(message.Identifier); identifier != "" {
+			out[identifier] = true
+		}
+	}
+	return out
+}
+
+func waitForMailConsistency(ctx context.Context, attempt int) error {
+	delay := time.Duration(120*(1<<attempt)) * time.Millisecond
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (c *ICloudClient) waitForMovedMailIdentifiers(ctx context.Context, session ICloudSession, trash mailFolder, sourceIdentifiers []string, before map[string]bool) ([]string, error) {
+	sourceIdentifiers = uniqueStrings(sourceIdentifiers)
+	if len(sourceIdentifiers) == 0 {
+		return nil, nil
+	}
+	for attempt := 0; attempt < 5; attempt++ {
+		messages, err := c.mailFolderMessagePage(ctx, session, trash, 1000)
+		if err != nil {
+			return nil, fmt.Errorf("确认邮件已移入 iCloud 废纸篓失败：%w", err)
+		}
+		after := mailIdentifierSet(messages)
+		targets := make([]string, 0, len(sourceIdentifiers))
+		selected := make(map[string]bool, len(sourceIdentifiers))
+		for _, identifier := range sourceIdentifiers {
+			if after[identifier] {
+				targets = append(targets, identifier)
+				selected[identifier] = true
+			}
+		}
+		missing := len(sourceIdentifiers) - len(targets)
+		if missing > 0 {
+			newIdentifiers := make([]string, 0, missing)
+			for identifier := range after {
+				if !before[identifier] && !selected[identifier] {
+					newIdentifiers = append(newIdentifiers, identifier)
+				}
+			}
+			// 只在新增数量与本次移动数量精确相等时使用新标识，避免误删其他邮件。
+			if len(newIdentifiers) == missing {
+				targets = append(targets, newIdentifiers...)
+			}
+		}
+		if len(targets) == len(sourceIdentifiers) {
+			sort.Strings(targets)
+			return targets, nil
+		}
+		if attempt < 4 {
+			if err := waitForMailConsistency(ctx, attempt); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return nil, errCode("icloud_trash_move_unconfirmed", "iCloud 未在废纸篓中返回本次移动的全部邮件，本地数据已保留", true)
+}
+
+func (c *ICloudClient) waitForDestroyedMailIdentifiers(ctx context.Context, session ICloudSession, trash mailFolder, identifiers []string) error {
+	wanted := make(map[string]bool, len(identifiers))
+	for _, identifier := range uniqueStrings(identifiers) {
+		wanted[identifier] = true
+	}
+	for attempt := 0; attempt < 5; attempt++ {
+		messages, err := c.mailFolderMessagePage(ctx, session, trash, 1000)
+		if err != nil {
+			return fmt.Errorf("确认 iCloud 废纸篓邮件已彻底删除失败：%w", err)
+		}
+		remaining := 0
+		for identifier := range mailIdentifierSet(messages) {
+			if wanted[identifier] {
+				remaining++
+			}
+		}
+		if remaining == 0 {
+			if len(messages) >= 1000 {
+				return errCode("icloud_trash_verify_incomplete", "iCloud 废纸篓返回已达 1000 封上限，本次彻底删除结果无法完整确认，本地数据已保留", true)
+			}
+			return nil
+		}
+		if attempt < 4 {
+			if err := waitForMailConsistency(ctx, attempt); err != nil {
+				return err
+			}
+		}
+	}
+	return errCode("icloud_trash_destroy_unconfirmed", "iCloud 废纸篓中仍存在本次要彻底删除的邮件，本地数据已保留", true)
 }
 
 func (c *ICloudClient) EmptyTrash(ctx context.Context, session ICloudSession) (int, error) {
@@ -2222,7 +2536,7 @@ func (c *ICloudClient) moveMailIdentifiersToTrash(ctx context.Context, session I
 				},
 			},
 		}
-		if err := c.callMail(ctx, session, "/mailws2/v1/email/set", body, "", &resp); err != nil {
+		if err := c.callMail(ctx, session, "/mailws2/v1/email/set", body, iCloudMailDeleteClientIntent, &resp); err != nil {
 			return moved, err
 		}
 		if len(resp.NotUpdated) > 0 {
@@ -2249,7 +2563,7 @@ func (c *ICloudClient) destroyMailIdentifiers(ctx context.Context, session IClou
 			"domain":  "email",
 			"destroy": chunk,
 		}
-		if err := c.callMail(ctx, session, "/mailws2/v1/email/set", body, "", &resp); err != nil {
+		if err := c.callMail(ctx, session, "/mailws2/v1/email/set", body, iCloudMailDeleteClientIntent, &resp); err != nil {
 			return destroyed, err
 		}
 		if len(resp.NotDestroyed) > 0 {

@@ -51,6 +51,9 @@ func (s *Store) AllMailboxes() []domain.Mailbox {
 	defer s.mu.RUnlock()
 	var out []domain.Mailbox
 	_ = s.loadEntities("mailboxes", `json_extract(data_json, '$.created_at') DESC`, &out)
+	for index := range out {
+		out[index] = sanitizeMailboxKind(out[index])
+	}
 	return out
 }
 
@@ -59,7 +62,7 @@ func (s *Store) FindMailboxByID(id string) (domain.Mailbox, bool) {
 	defer s.mu.RUnlock()
 	var mailbox domain.Mailbox
 	found, err := s.readEntity("mailboxes", strings.TrimSpace(id), &mailbox)
-	return mailbox, found && err == nil
+	return sanitizeMailboxKind(mailbox), found && err == nil
 }
 
 func (s *Store) FindMailboxByEmail(email string) (domain.Mailbox, bool) {
@@ -74,7 +77,7 @@ func (s *Store) FindMailboxByEmail(email string) (domain.Mailbox, bool) {
 	if s.decodeEntity("mailboxes", data, &mailbox) != nil {
 		return domain.Mailbox{}, false
 	}
-	return mailbox, true
+	return sanitizeMailboxKind(mailbox), true
 }
 
 func (s *Store) UpsertMailboxFromRemote(accountID string, remote domain.RemoteMailbox, defaultNote string) (domain.Mailbox, bool, error) {
@@ -103,6 +106,9 @@ func (s *Store) UpsertMailboxFromRemote(accountID string, remote domain.RemoteMa
 			return domain.Mailbox{}, false, err
 		}
 		mailbox.AccountID = firstNonEmpty(accountID, mailbox.AccountID)
+		if strings.TrimSpace(mailbox.MailboxKind) == "" {
+			mailbox.MailboxKind = domain.MailboxKindICloudHME
+		}
 		mailbox.AnonymousID = firstNonEmpty(remote.AnonymousID, mailbox.AnonymousID)
 		mailbox.RemoteOrigin = firstNonEmpty(remote.Origin, mailbox.RemoteOrigin)
 		mailbox.ForwardToEmail = firstNonEmpty(strings.ToLower(strings.TrimSpace(remote.ForwardToEmail)), mailbox.ForwardToEmail)
@@ -148,7 +154,7 @@ func (s *Store) UpsertMailboxFromRemote(accountID string, remote domain.RemoteMa
 	}
 	mailbox = domain.Mailbox{
 		ID: id, OwnerID: ownerID, AccountID: strings.TrimSpace(accountID), AnonymousID: strings.TrimSpace(remote.AnonymousID),
-		RemoteOrigin: strings.TrimSpace(remote.Origin), Label: firstNonEmpty(remote.Label, "隐私邮箱 "+now.Format("0102-150405")),
+		RemoteOrigin: strings.TrimSpace(remote.Origin), MailboxKind: domain.MailboxKindICloudHME, Label: firstNonEmpty(remote.Label, "隐私邮箱 "+now.Format("0102-150405")),
 		Email: email, ForwardToEmail: strings.ToLower(strings.TrimSpace(remote.ForwardToEmail)), APIToken: token, APIActive: true, ICloudActive: remote.IsActive, Status: status,
 		Note: firstNonEmpty(remote.Note, defaultNote), CreatedAt: now, UpdatedAt: now,
 	}
@@ -219,10 +225,6 @@ func (s *Store) SetMailboxStatus(id string, apiActive, icloudActive *bool, statu
 	}
 	desiredStatus := strings.TrimSpace(status)
 	if desiredStatus != "" {
-		if desiredStatus == domain.StatusReserved && mailbox.ActiveLeaseID == "" {
-			_ = tx.Rollback()
-			return domain.Mailbox{}, errors.New("邮箱没有有效租约，不能手动标记为已预留")
-		}
 		if mailbox.ActiveLeaseID != "" && desiredStatus != domain.StatusReserved {
 			var lease domain.MailboxLease
 			if found, _ := s.readEntityTx(tx, "mailbox_leases", mailbox.ActiveLeaseID, &lease); found && lease.State == domain.MailboxLeaseClaimed {
@@ -300,6 +302,10 @@ func (s *Store) DeleteMailbox(id string) error {
 		return err
 	}
 	if _, err := tx.Exec(`DELETE FROM mailbox_leases WHERE json_extract(data_json, '$.mailbox_id') = ?`, id); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM mailbox_history_states WHERE id = ?`, id); err != nil {
 		_ = tx.Rollback()
 		return err
 	}
@@ -446,14 +452,18 @@ func (s *Store) upsertMessageDetailedTx(tx *sql.Tx, mailboxID string, incoming M
 
 // ApplyMailboxSyncBatch 使用一个 SQLite 事务写入整组邮箱同步结果，并只发布一条批量 SSE。
 func (s *Store) ApplyMailboxSyncBatch(updates []MailboxSyncUpdate) (int, error) {
-	return s.applyMailboxSyncBatch(updates, "", nil)
+	return s.applyMailboxSyncBatch(updates, "", nil, nil)
 }
 
 func (s *Store) ApplyMailboxSyncBatchWithRuntimeState(updates []MailboxSyncUpdate, stateID string, state any) (int, error) {
-	return s.applyMailboxSyncBatch(updates, strings.TrimSpace(stateID), state)
+	return s.applyMailboxSyncBatch(updates, strings.TrimSpace(stateID), state, nil)
 }
 
-func (s *Store) applyMailboxSyncBatch(updates []MailboxSyncUpdate, stateID string, state any) (int, error) {
+func (s *Store) ApplyMailboxSyncBatchWithIndex(updates []MailboxSyncUpdate, stateID string, state any, index MailIndexCommit) (int, error) {
+	return s.applyMailboxSyncBatch(updates, strings.TrimSpace(stateID), state, &index)
+}
+
+func (s *Store) applyMailboxSyncBatch(updates []MailboxSyncUpdate, stateID string, state any, index *MailIndexCommit) (int, error) {
 	if len(updates) == 0 {
 		return 0, nil
 	}
@@ -517,12 +527,20 @@ func (s *Store) applyMailboxSyncBatch(updates []MailboxSyncUpdate, stateID strin
 		}
 	}
 	stateChanged := false
+	if index != nil {
+		indexChanged, err := s.applyMailIndexCommitTx(tx, *index)
+		if err != nil {
+			_ = tx.Rollback()
+			return created, err
+		}
+		stateChanged = stateChanged || indexChanged
+	}
 	if stateID != "" && state != nil {
 		if _, changed, err := s.upsertEntityTx(tx, "runtime_states", "mail-sync", stateID, state); err != nil {
 			_ = tx.Rollback()
 			return created, err
 		} else {
-			stateChanged = changed
+			stateChanged = stateChanged || changed
 		}
 	}
 	if created == 0 && updatedMessages == 0 && len(changedMailboxes) == 0 && !stateChanged {

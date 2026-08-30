@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	databaseSchemaVersion = 5
+	databaseSchemaVersion = 7
 	defaultChangeLogLimit = 5000
 	secretPrefix          = "enc:v1:"
 )
@@ -31,12 +31,16 @@ var entityTables = []string{
 	"web_sessions",
 	"apple_accounts",
 	"mailboxes",
+	"domain_mail_routes",
+	"domain_mail_settings",
 	"mailbox_leases",
 	"messages",
 	"events",
 	"settings",
 	"create_settings",
 	"icloud_sessions",
+	"mail_message_index",
+	"mailbox_history_states",
 }
 
 // Change 描述一次已经提交到 SQLite 的数据变更，供 SSE 客户端增量刷新。
@@ -236,6 +240,8 @@ func migrateDatabase(db *sql.DB) error {
 		{version: 3, statements: migrationV3()},
 		{version: 4, statements: migrationV4()},
 		{version: 5, statements: migrationV5()},
+		{version: 6, statements: migrationV6()},
+		{version: 7, statements: migrationV7()},
 	}
 	for _, migration := range migrations {
 		var applied int
@@ -366,8 +372,58 @@ func migrationV5() []string {
 	}
 }
 
+func migrationV6() []string {
+	return []string{
+		`CREATE TABLE IF NOT EXISTS domain_mail_routes (
+			id TEXT PRIMARY KEY,
+			data_json BLOB NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS domain_mail_settings (
+			id TEXT PRIMARY KEY,
+			data_json BLOB NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_domain_mail_routes_domain ON domain_mail_routes(lower(json_extract(data_json, '$.domain')))`,
+		`CREATE INDEX IF NOT EXISTS idx_mailboxes_kind_domain_route ON mailboxes (
+			COALESCE(json_extract(data_json, '$.mailbox_kind'), 'icloud_hme'),
+			json_extract(data_json, '$.domain_route_id'),
+			json_extract(data_json, '$.created_at') DESC
+		)`,
+	}
+}
+
+func migrationV7() []string {
+	return []string{
+		`CREATE TABLE IF NOT EXISTS mail_message_index (
+			id TEXT PRIMARY KEY,
+			data_json BLOB NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS mailbox_history_states (
+			id TEXT PRIMARY KEY,
+			data_json BLOB NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_mail_message_index_source_uid ON mail_message_index (
+			json_extract(data_json, '$.source_key'),
+			json_extract(data_json, '$.folder'),
+			json_extract(data_json, '$.uid_validity'),
+			json_extract(data_json, '$.uid')
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_mail_message_index_source_received ON mail_message_index (
+			json_extract(data_json, '$.source_key'),
+			json_extract(data_json, '$.received_at') DESC
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_mailbox_history_source_complete ON mailbox_history_states (
+			json_extract(data_json, '$.source_key'),
+			json_extract(data_json, '$.complete')
+		)`,
+	}
+}
+
 func (s *Store) encryptSensitiveRows() error {
-	for _, table := range []string{"apple_accounts", "mailboxes", "settings", "icloud_sessions"} {
+	for _, table := range []string{"apple_accounts", "mailboxes", "settings", "icloud_sessions", "domain_mail_routes"} {
 		rows, err := s.db.Query(`SELECT id, data_json FROM ` + table)
 		if err != nil {
 			return err
@@ -440,6 +496,8 @@ func (s *Store) transformSecrets(table string, value any, encrypt bool) error {
 		for _, key := range []string{"value", "api_key", "data_access_token", "imap_app_password"} {
 			keys[key] = true
 		}
+	case "domain_mail_routes":
+		keys["imap_password"] = true
 	}
 	if len(keys) == 0 {
 		return nil

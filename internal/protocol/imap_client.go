@@ -15,6 +15,8 @@ import (
 	"mime/quotedprintable"
 	"net"
 	"net/mail"
+	"net/textproto"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -837,17 +839,32 @@ func syncICloudIMAPMessages(ctx context.Context, state LoginState, mailboxes []M
 		return iCloudIMAPSyncResult{}, errCode("imap_select_failed", "打开 iCloud 收件箱失败："+imapResponseSummary(selectLines), true)
 	}
 	uidValidity := imapSelectUIDValidity(selectLines)
+	snapshotHighUID := imapSelectLastUID(selectLines)
 	cursorUID := strings.TrimSpace(options.CursorUID)
-	if cursorUID == "" && options.UseCursor {
+	if cursorUID == "" && options.UseCursor && !options.FullScan {
 		cursorUID = strings.TrimSpace(state.IMAPLastSyncUID)
 	}
 	savedValidity := strings.TrimSpace(options.CursorUIDValidity)
-	useMailboxCursor := options.UseCursor && savedValidity == ""
-	if savedValidity != "" && uidValidity != "" && savedValidity != uidValidity {
+	uidValidityChanged := savedValidity != "" && uidValidity != "" && savedValidity != uidValidity
+	useSearchCursor := options.UseCursor && !options.FullScan && !uidValidityChanged
+	useMailboxCursor := useSearchCursor && savedValidity == ""
+	if uidValidityChanged {
 		cursorUID = ""
 		useMailboxCursor = false
+		options.Mode = MailSyncModeAllRecent
+		options.FullScan = true
+		options.After = time.Time{}
+		maxMessages = 0
 	}
-	searchCommand, incremental := imapSearchCommand(cursorUID, mailboxes, options.After, options.UseCursor, useMailboxCursor)
+	if useSearchCursor && imapUIDNumber(cursorUID) >= snapshotHighUID {
+		_, _ = imapCommand(conn, reader, "A003", "LOGOUT")
+		return iCloudIMAPSyncResult{MessagesByMailbox: map[string][]ICloudSyncedMessage{}, UIDValidity: uidValidity, LastUID: cursorUID}, nil
+	}
+	if snapshotHighUID <= 0 {
+		_, _ = imapCommand(conn, reader, "A003", "LOGOUT")
+		return iCloudIMAPSyncResult{MessagesByMailbox: map[string][]ICloudSyncedMessage{}, UIDValidity: uidValidity}, nil
+	}
+	searchCommand, incremental := imapSearchCommand(cursorUID, mailboxes, options.After, useSearchCursor, useMailboxCursor, snapshotHighUID)
 	searchLines, err := imapCommand(conn, reader, "A003", searchCommand)
 	if err != nil {
 		return iCloudIMAPSyncResult{}, errCode("imap_search_failed", "搜索 iCloud IMAP 邮件失败："+err.Error(), true)
@@ -858,7 +875,11 @@ func syncICloudIMAPMessages(ctx context.Context, state LoginState, mailboxes []M
 	uids := imapSearchUIDs(searchLines)
 	if len(uids) == 0 {
 		_, _ = imapCommand(conn, reader, "A004", "LOGOUT")
-		return iCloudIMAPSyncResult{MessagesByMailbox: map[string][]ICloudSyncedMessage{}, UIDValidity: uidValidity, LastUID: cursorUID}, nil
+		lastUID := cursorUID
+		if snapshotHighUID > imapUIDNumber(lastUID) {
+			lastUID = strconv.Itoa(snapshotHighUID)
+		}
+		return iCloudIMAPSyncResult{MessagesByMailbox: map[string][]ICloudSyncedMessage{}, UIDValidity: uidValidity, LastUID: lastUID}, nil
 	}
 	sortInts(uids)
 	totalUIDs := len(uids)
@@ -874,52 +895,138 @@ func syncICloudIMAPMessages(ctx context.Context, state LoginState, mailboxes []M
 	if len(uids) > 0 {
 		lastUID = strconv.Itoa(uids[len(uids)-1])
 	}
+	if totalUIDs == len(uids) && snapshotHighUID > imapUIDNumber(lastUID) {
+		lastUID = strconv.Itoa(snapshotHighUID)
+	}
 
 	tag := 4
 	messages := make(map[string][]ICloudSyncedMessage)
+	discovered := make(map[string][]ICloudSyncedMessage)
+	indexEntries := make([]MailIndexEntry, 0, len(uids))
 	scanned := 0
 	uidBatches := [][]int{uids}
 	if options.FullScan {
 		uidBatches = chunkInts(uids, 200)
 	}
 	for _, uidBatch := range uidBatches {
-		batchMessages, batchScanned, fetchErr := fetchAndMatchICloudIMAPMessages(conn, reader, &tag, uidBatch, mailboxes, options, keyword, state)
+		batchMessages, batchDiscovered, batchIndex, batchScanned, fetchErr := fetchAndMatchICloudIMAPMessages(conn, reader, &tag, uidBatch, mailboxes, options, keyword, state)
 		if fetchErr != nil {
 			return iCloudIMAPSyncResult{}, fetchErr
 		}
 		scanned += batchScanned
+		indexEntries = append(indexEntries, batchIndex...)
 		for mailboxID, items := range batchMessages {
 			messages[mailboxID] = append(messages[mailboxID], items...)
 		}
+		for email, items := range batchDiscovered {
+			discovered[email] = append(discovered[email], items...)
+		}
 	}
 	_, _ = imapCommand(conn, reader, fmt.Sprintf("A%03d", tag+1), "LOGOUT")
-	return iCloudIMAPSyncResult{
+	result := iCloudIMAPSyncResult{
 		MessagesByMailbox: messages,
+		DiscoveredByEmail: discovered,
 		UIDValidity:       uidValidity,
 		LastUID:           lastUID,
 		Scanned:           scanned,
-		Matched:           countMatchedMessages(messages),
 		HasMore:           !options.FullScan && totalUIDs > len(uids),
 		InitializedCursor: initializedCursor,
-	}, nil
+		IndexEntries:      indexEntries,
+	}
+	result.Matched = countMailSyncMatches(result)
+	return result, nil
 }
 
-func fetchAndMatchICloudIMAPMessages(conn net.Conn, reader *bufio.Reader, tag *int, uids []int, mailboxes []Mailbox, options MailSyncOptions, keyword string, state LoginState) (map[string][]ICloudSyncedMessage, int, error) {
-	previews, err := fetchICloudIMAPRawMessages(conn, reader, tag, uids, 20, 64<<10)
+func fetchAndMatchICloudIMAPMessages(conn net.Conn, reader *bufio.Reader, tag *int, uids []int, mailboxes []Mailbox, options MailSyncOptions, keyword string, state LoginState) (map[string][]ICloudSyncedMessage, map[string][]ICloudSyncedMessage, []MailIndexEntry, int, error) {
+	headers, err := fetchICloudIMAPRawHeaders(conn, reader, tag, uids, 50)
 	if err != nil {
-		return nil, 0, err
+		return nil, nil, nil, 0, err
 	}
-	previewMatches := iCloudIMAPMessagesByMailbox(previews, mailboxes, options.After, keyword, options.VerificationOnly(), state.IMAPEmail, state.IMAPUsername)
-	matchedUIDs := matchedIMAPUIDs(previewMatches)
-	fetched := previews
+	aliases := mailboxAliases(mailboxes, state.IMAPEmail, state.IMAPUsername)
+	matchedUIDs := make([]int, 0)
+	indexEntries := make([]MailIndexEntry, 0, len(headers))
+	seenMatched := make(map[int]bool)
+	for _, header := range headers {
+		entry, recipients, ok := parseICloudIMAPHeader(header)
+		if !ok {
+			continue
+		}
+		indexEntries = append(indexEntries, entry)
+		uid := imapUIDNumber(entry.UID)
+		if uid <= 0 || seenMatched[uid] {
+			continue
+		}
+		if len(matchingMailboxIDs(recipients, aliases)) > 0 || len(matchingDiscoveredEmails(recipients, options.DiscoveryDomains, aliases)) > 0 {
+			seenMatched[uid] = true
+			matchedUIDs = append(matchedUIDs, uid)
+		}
+	}
+	sortInts(matchedUIDs)
+	fetched := make([]iCloudIMAPFetchedMessage, 0, len(matchedUIDs))
 	if len(matchedUIDs) > 0 {
 		fetched, err = fetchICloudIMAPRawMessages(conn, reader, tag, matchedUIDs, 8, 4<<20)
 		if err != nil {
-			return nil, 0, err
+			return nil, nil, nil, 0, err
 		}
 	}
-	messages := iCloudIMAPMessagesByMailbox(fetched, mailboxes, options.After, keyword, options.VerificationOnly(), state.IMAPEmail, state.IMAPUsername)
-	return messages, len(previews), nil
+	matchingMailboxes := mailboxes
+	matchingAfter := options.After
+	if options.FullScan {
+		matchingMailboxes = append([]Mailbox(nil), mailboxes...)
+		for index := range matchingMailboxes {
+			matchingMailboxes[index].LastSyncAt = time.Time{}
+			matchingMailboxes[index].LastSyncUID = ""
+		}
+		matchingAfter = time.Time{}
+	}
+	messages, discovered := iCloudIMAPMessagesByMailboxWithDiscovery(fetched, matchingMailboxes, matchingAfter, keyword, options.VerificationOnly(), options.DiscoveryDomains, state.IMAPEmail, state.IMAPUsername)
+	completeByUID := make(map[string]ICloudSyncedMessage, len(fetched))
+	for _, item := range fetched {
+		if message, _, ok := parseICloudIMAPMessage(item); ok {
+			completeByUID[message.UID] = message
+		}
+	}
+	for index := range indexEntries {
+		if message, found := completeByUID[indexEntries[index].UID]; found {
+			indexEntries[index] = mailIndexEntryFromMessage(indexEntries[index], message)
+		}
+	}
+	return messages, discovered, indexEntries, len(headers), nil
+}
+
+func fetchICloudIMAPRawHeaders(conn net.Conn, reader *bufio.Reader, tag *int, uids []int, chunkSize int) ([]iCloudIMAPFetchedMessage, error) {
+	if chunkSize <= 0 {
+		chunkSize = 50
+	}
+	fetched := make([]iCloudIMAPFetchedMessage, 0, len(uids))
+	for _, chunk := range chunkInts(uids, chunkSize) {
+		*tag++
+		tagName := fmt.Sprintf("A%03d", *tag)
+		lines, literals, err := imapCommandWithLiterals(conn, reader, tagName, "UID FETCH "+imapUIDSet(chunk)+" (UID BODY.PEEK[HEADER])")
+		if err != nil {
+			return nil, errCode("imap_fetch_failed", "读取 iCloud IMAP 邮件头失败："+err.Error(), true)
+		}
+		if !imapTaggedOK(lines, tagName) {
+			return nil, errCode("imap_fetch_failed", "读取 iCloud IMAP 邮件头失败："+imapResponseSummary(lines), true)
+		}
+		fetchUIDs := imapFetchUIDs(lines)
+		for index, raw := range literals {
+			if index < len(fetchUIDs) {
+				fetched = append(fetched, iCloudIMAPFetchedMessage{UID: strconv.Itoa(fetchUIDs[index]), Raw: raw})
+			}
+		}
+	}
+	return fetched, nil
+}
+
+func mergeMessageMaps(groups ...map[string][]ICloudSyncedMessage) map[string][]ICloudSyncedMessage {
+	out := make(map[string][]ICloudSyncedMessage)
+	for _, group := range groups {
+		for key, items := range group {
+			out[key] = append(out[key], items...)
+		}
+	}
+	return out
 }
 
 func fetchICloudIMAPRawMessages(conn net.Conn, reader *bufio.Reader, tag *int, uids []int, chunkSize, byteLimit int) ([]iCloudIMAPFetchedMessage, error) {
@@ -966,9 +1073,13 @@ func matchedIMAPUIDs(messages map[string][]ICloudSyncedMessage) []int {
 	return uids
 }
 
-func imapSearchCommand(cursorUID string, mailboxes []Mailbox, after time.Time, useCursor, useMailboxCursor bool) (string, bool) {
+func imapSearchCommand(cursorUID string, mailboxes []Mailbox, after time.Time, useCursor, useMailboxCursor bool, highUID ...int) (string, bool) {
+	high := "*"
+	if len(highUID) > 0 && highUID[0] > 0 {
+		high = strconv.Itoa(highUID[0])
+	}
 	if uid := imapUIDNumber(cursorUID); useCursor && uid > 0 {
-		return "UID SEARCH UID " + strconv.Itoa(uid+1) + ":*", true
+		return "UID SEARCH UID " + strconv.Itoa(uid+1) + ":" + high, true
 	}
 	nextUID := 0
 	for _, mailbox := range mailboxes {
@@ -985,16 +1096,23 @@ func imapSearchCommand(cursorUID string, mailboxes []Mailbox, after time.Time, u
 		}
 	}
 	if nextUID > 0 {
-		return "UID SEARCH UID " + strconv.Itoa(nextUID) + ":*", true
+		return "UID SEARCH UID " + strconv.Itoa(nextUID) + ":" + high, true
 	}
 	searchAfter := after
 	if searchAfter.IsZero() {
 		if !useCursor {
+			if high != "*" {
+				return "UID SEARCH UID 1:" + high, false
+			}
 			return "UID SEARCH ALL", false
 		}
 		searchAfter = time.Now().Add(-24 * time.Hour)
 	}
-	return "UID SEARCH SINCE " + searchAfter.Format("2-Jan-2006"), false
+	command := "UID SEARCH SINCE " + searchAfter.Format("2-Jan-2006")
+	if high != "*" {
+		command += " UID 1:" + high
+	}
+	return command, false
 }
 
 func imapSelectUIDValidity(lines []string) string {
@@ -1055,6 +1173,11 @@ type iCloudIMAPFetchedMessage struct {
 }
 
 func iCloudIMAPMessagesByMailbox(fetched []iCloudIMAPFetchedMessage, mailboxes []Mailbox, after time.Time, keyword string, verificationOnly bool, ignoredEmails ...string) map[string][]ICloudSyncedMessage {
+	messages, _ := iCloudIMAPMessagesByMailboxWithDiscovery(fetched, mailboxes, after, keyword, verificationOnly, nil, ignoredEmails...)
+	return messages
+}
+
+func iCloudIMAPMessagesByMailboxWithDiscovery(fetched []iCloudIMAPFetchedMessage, mailboxes []Mailbox, after time.Time, keyword string, verificationOnly bool, discoveryDomains []string, ignoredEmails ...string) (map[string][]ICloudSyncedMessage, map[string][]ICloudSyncedMessage) {
 	now := time.Now()
 	aliases := make(map[string]string)
 	afterByMailbox := make(map[string]time.Time)
@@ -1077,6 +1200,7 @@ func iCloudIMAPMessagesByMailbox(fetched []iCloudIMAPFetchedMessage, mailboxes [
 		afterByMailbox[id] = mailboxSyncAfter(mailbox, after, now)
 	}
 	out := make(map[string][]ICloudSyncedMessage, len(aliases))
+	discovered := make(map[string][]ICloudSyncedMessage)
 	for _, item := range fetched {
 		message, recipients, ok := parseICloudIMAPMessage(item)
 		if !ok {
@@ -1086,7 +1210,8 @@ func iCloudIMAPMessagesByMailbox(fetched []iCloudIMAPFetchedMessage, mailboxes [
 			continue
 		}
 		matchedMailboxIDs := matchingMailboxIDs(recipients, aliases)
-		if len(matchedMailboxIDs) == 0 {
+		discoveredEmails := matchingDiscoveredEmails(recipients, discoveryDomains, aliases)
+		if len(matchedMailboxIDs) == 0 && len(discoveredEmails) == 0 {
 			continue
 		}
 		for _, mailboxID := range matchedMailboxIDs {
@@ -1095,11 +1220,17 @@ func iCloudIMAPMessagesByMailbox(fetched []iCloudIMAPFetchedMessage, mailboxes [
 			}
 			out[mailboxID] = append(out[mailboxID], message)
 		}
+		for _, email := range discoveredEmails {
+			discovered[email] = append(discovered[email], message)
+		}
 	}
 	for mailboxID := range out {
 		sortMessagesByReceivedAt(out[mailboxID])
 	}
-	return out
+	for email := range discovered {
+		sortMessagesByReceivedAt(discovered[email])
+	}
+	return out, discovered
 }
 
 func parseICloudIMAPMessage(item iCloudIMAPFetchedMessage) (ICloudSyncedMessage, string, bool) {
@@ -1120,7 +1251,7 @@ func parseICloudIMAPMessage(item iCloudIMAPFetchedMessage) (ICloudSyncedMessage,
 	if uid != "" {
 		remoteID += ":" + uid
 	}
-	recipients := imapHeaderText(msg.Header)
+	recipients := imapRecipientHeaderText(msg.Header)
 	textBody := strings.TrimSpace(body.Text)
 	if textBody == "" && strings.TrimSpace(body.HTML) != "" {
 		textBody = normalizeMailBody(body.HTML)
@@ -1141,7 +1272,84 @@ func parseICloudIMAPMessage(item iCloudIMAPFetchedMessage) (ICloudSyncedMessage,
 		HTMLBody:    strings.TrimSpace(body.HTML),
 		ContentType: contentType,
 		ReceivedAt:  receivedAt,
+		Recipients:  extractRecipientEmails(recipients),
 	}, recipients, true
+}
+
+func parseICloudIMAPHeader(item iCloudIMAPFetchedMessage) (MailIndexEntry, string, bool) {
+	msg, err := mail.ReadMessage(bytes.NewReader(item.Raw))
+	if err != nil {
+		return MailIndexEntry{}, "", false
+	}
+	subject := decodeMIMEHeader(msg.Header.Get("Subject"))
+	from := decodeMIMEHeader(msg.Header.Get("From"))
+	receivedAt := time.Now()
+	if date, err := msg.Header.Date(); err == nil {
+		receivedAt = date
+	}
+	uid := strings.TrimSpace(item.UID)
+	remoteID := "imap"
+	if uid != "" {
+		remoteID += ":" + uid
+	}
+	recipientText := imapRecipientHeaderText(msg.Header)
+	entry := MailIndexEntry{
+		UID: uid, RemoteID: remoteID, RemoteIDs: []string{remoteID},
+		CanonicalID: canonicalMailID(msg.Header.Get("Message-ID"), from, subject, receivedAt),
+		Recipients:  extractRecipientEmails(recipientText), Source: "imap", Subject: subject, From: from,
+		ContentType: "text/plain", ReceivedAt: receivedAt,
+	}
+	return entry, recipientText, uid != ""
+}
+
+func mailIndexEntryFromMessage(entry MailIndexEntry, message ICloudSyncedMessage) MailIndexEntry {
+	entry.UID = firstNonEmpty(message.UID, entry.UID)
+	entry.RemoteID = firstNonEmpty(message.RemoteID, entry.RemoteID)
+	entry.RemoteIDs = uniqueStrings(append(append(entry.RemoteIDs, message.RemoteIDs...), entry.RemoteID))
+	entry.CanonicalID = firstNonEmpty(message.CanonicalID, entry.CanonicalID)
+	entry.Source = firstNonEmpty(message.Source, entry.Source)
+	entry.Subject = firstNonEmpty(message.Subject, entry.Subject)
+	entry.From = firstNonEmpty(message.From, entry.From)
+	entry.Body = message.Body
+	entry.HTMLBody = message.HTMLBody
+	entry.ContentType = firstNonEmpty(message.ContentType, entry.ContentType)
+	if !message.ReceivedAt.IsZero() {
+		entry.ReceivedAt = message.ReceivedAt
+	}
+	entry.BodyComplete = true
+	return entry
+}
+
+func mailboxAliases(mailboxes []Mailbox, ignoredEmails ...string) map[string]string {
+	ignored := make(map[string]bool, len(ignoredEmails))
+	for _, email := range ignoredEmails {
+		if email = normalizeICloudIMAPEmail(email); email != "" {
+			ignored[email] = true
+		}
+	}
+	aliases := make(map[string]string, len(mailboxes))
+	for _, mailbox := range mailboxes {
+		email := normalizeICloudIMAPEmail(mailbox.Email)
+		if strings.TrimSpace(mailbox.ID) != "" && email != "" && !ignored[email] {
+			aliases[mailbox.ID] = email
+		}
+	}
+	return aliases
+}
+
+func extractRecipientEmails(text string) []string {
+	seen := make(map[string]bool)
+	out := make([]string, 0)
+	for _, match := range recipientEmailPattern.FindAllString(text, -1) {
+		email := strings.ToLower(strings.Trim(match, `"'<>[](),;`))
+		if email == "" || seen[email] {
+			continue
+		}
+		seen[email] = true
+		out = append(out, email)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func normalizeICloudIMAPState(state LoginState) (LoginState, error) {
@@ -1262,6 +1470,20 @@ func imapHeaderText(header mail.Header) string {
 	var out []string
 	for key, values := range header {
 		for _, value := range values {
+			out = append(out, key+": "+decodeMIMEHeader(value))
+		}
+	}
+	return strings.Join(out, "\n")
+}
+
+func imapRecipientHeaderText(header mail.Header) string {
+	keys := []string{
+		"To", "Cc", "Bcc", "Delivered-To", "X-Original-To", "Envelope-To", "X-Envelope-To",
+		"Resent-To", "Apparently-To", "X-Forwarded-To", "Original-Recipient", "X-Original-Recipient",
+	}
+	var out []string
+	for _, key := range keys {
+		for _, value := range header[textproto.CanonicalMIMEHeaderKey(key)] {
 			out = append(out, key+": "+decodeMIMEHeader(value))
 		}
 	}

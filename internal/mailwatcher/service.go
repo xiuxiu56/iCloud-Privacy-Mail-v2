@@ -20,6 +20,9 @@ import (
 const (
 	mailWatcherSyncTimeout = 90 * time.Second
 	mailWatcherActiveTTL   = 20 * time.Minute
+	mailReconcileTimeout   = 5 * time.Minute
+	mailReconcileLookback  = 30 * 24 * time.Hour
+	mailReconcileRetry     = 10 * time.Minute
 )
 
 type Service struct {
@@ -114,6 +117,7 @@ func (s *Service) Run(ctx context.Context) {
 	knownGroups := make(map[string]string)
 	webNextAt := make(map[string]time.Time)
 	webFailures := make(map[string]int)
+	reconcileRetryAt := make(map[string]time.Time)
 	defer stopIdleWorkers(workers)
 	defer s.resetReadyWorkers()
 	s.log.Info("后台邮件监听已启动", "分组重检间隔", reconcileInterval, "Web 轮询间隔", s.webPollInterval())
@@ -174,6 +178,7 @@ func (s *Service) Run(ctx context.Context) {
 			delete(knownGroups, key)
 			delete(webNextAt, key)
 			delete(webFailures, key)
+			delete(reconcileRetryAt, key)
 		}
 		enabledLastCycle = true
 
@@ -214,6 +219,16 @@ func (s *Service) Run(ctx context.Context) {
 				webFailures[group.key] = 0
 			}
 			webNextAt[group.key] = now.Add(s.webPollDelay(group.key, webFailures[group.key]))
+		}
+		for _, group := range groups {
+			if initialKeys[group.key] || !group.hasIMAP || now.Before(reconcileRetryAt[group.key]) || !s.mailbox.MailReconcileDue(group.key, now) {
+				continue
+			}
+			if err := s.reconcileWatchGroup(ctx, group); err != nil {
+				reconcileRetryAt[group.key] = now.Add(mailReconcileRetry)
+			} else {
+				delete(reconcileRetryAt, group.key)
+			}
 		}
 	}
 
@@ -294,6 +309,24 @@ func (s *Service) syncWatchGroup(ctx context.Context, group watchGroup, initial,
 	s.recordSyncResult(result, err, webPoll)
 	if err != nil && ctx.Err() == nil {
 		s.log.Warn("后台账号级同步邮箱失败", "账号", group.session.AppleID, "邮箱数", len(group.mailboxes), "首次同步", initial, "Web 轮询", webPoll, "错误", err)
+	}
+	return err
+}
+
+func (s *Service) reconcileWatchGroup(ctx context.Context, group watchGroup) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	syncCtx, cancel := context.WithTimeout(ctx, mailReconcileTimeout)
+	result, err := s.mailbox.SyncMailboxBatchWithOptions(syncCtx, group.mailboxes, mailboxservice.MessageSyncOptions{
+		Mode: protocol.MailSyncModeAllRecent, Trigger: "reconcile", After: time.Now().Add(-mailReconcileLookback),
+		FullScan: true, UseCursor: true, Reconcile: true,
+		AllowWebAPI: group.hasWeb, AllowFallback: group.hasWeb, UseWebComplement: group.hasWeb,
+	})
+	cancel()
+	s.recordSyncResult(result, err, false)
+	if err != nil && ctx.Err() == nil {
+		s.log.Warn("邮件近期对账失败", "账号", group.session.AppleID, "邮箱数", len(group.mailboxes), "错误", err)
 	}
 	return err
 }
@@ -487,6 +520,7 @@ func (s *Service) resetReadyWorkers() {
 
 func (s *Service) groups(allowWebAPI bool) []watchGroup {
 	active := s.activeMailboxIDs(time.Now())
+	domainSettings := s.store.DomainMailSettings()
 	type bucket struct {
 		session   domain.ICloudSession
 		state     domain.LoginState
@@ -504,7 +538,30 @@ func (s *Service) groups(allowWebAPI bool) []watchGroup {
 		if !mailbox.APIActive || !mailbox.ICloudActive || mailbox.Status == domain.StatusDisabled {
 			continue
 		}
+		if mailbox.MailboxKind == domain.MailboxKindDomainForward && !domainSettings.Enabled {
+			continue
+		}
 		accountID := strings.TrimSpace(mailbox.AccountID)
+		if mailbox.MailboxKind == domain.MailboxKindDomainForward && strings.TrimSpace(mailbox.DomainRouteID) != "" {
+			if route, found := s.store.DomainMailRouteForSync(mailbox.DomainRouteID); found && route.Enabled && route.ReceiverType == domain.DomainReceiverCustomIMAP {
+				state := domain.LoginState{
+					Kind: domain.LoginStateICloudIMAP, IMAPEmail: route.ForwardToEmail, IMAPUsername: route.IMAPUsername,
+					IMAPHost: route.IMAPHost, IMAPPort: route.IMAPPort, IMAPAppPassword: route.IMAPPassword,
+				}
+				hasIMAP := strings.TrimSpace(state.IMAPUsername) != "" && strings.TrimSpace(state.IMAPAppPassword) != ""
+				if !hasIMAP {
+					continue
+				}
+				key := "domain-route:" + route.ID
+				item := buckets[key]
+				if item == nil {
+					item = &bucket{session: domain.ICloudSession{AccountID: key, AppleID: route.ForwardToEmail}, state: state, hasIMAP: true}
+					buckets[key] = item
+				}
+				item.mailboxes = append(item.mailboxes, mailbox)
+				continue
+			}
+		}
 		entry, cached := sessions[accountID]
 		if !cached {
 			entry.session, entry.found = s.store.ICloudSessionByAccountID(accountID)
