@@ -4953,6 +4953,24 @@ textarea.field {
   font-weight: 750;
 }
 
+.public-code-form-label {
+  display: flex;
+  min-height: 16px;
+  align-items: center;
+  gap: 6px;
+  line-height: 16px;
+}
+
+.public-code-form-label .public-mailbox-type {
+  min-height: 16px;
+  box-sizing: border-box;
+  line-height: 1;
+}
+
+.field.public-code-email-field {
+  height: 40px;
+}
+
 .public-mailbox-type.is-domain {
   color: #0369a1;
   background: #e0f2fe;

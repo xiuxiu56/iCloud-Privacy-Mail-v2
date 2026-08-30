@@ -13,7 +13,7 @@ const emit = defineEmits(['close', 'toggle-theme'])
 const { currentVersion, currentCommit } = useUpdates()
 
 const versionText = computed(() => {
-  const value = String(currentVersion.value || '2.2.0').trim()
+  const value = String(currentVersion.value || '2.2.1').trim()
   return /^v/i.test(value) ? value : `v${value}`
 })
 const commitText = computed(() => {

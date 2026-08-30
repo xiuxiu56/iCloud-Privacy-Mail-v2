@@ -1,13 +1,22 @@
 {
   "schema_version": 1,
   "latest": {
-    "version": "2.2.0",
-    "name": "2.2.0 源码版",
-    "notes": "新增域名邮箱收件系统，支持地址生成、双通道同步、外部 API 取码与云端邮件删除。请重新下载最新源代码，并按照 README 重新构建和启动。",
-    "published_at": "2026-08-30T00:00:00+08:00",
+    "version": "2.2.1",
+    "name": "2.2.1 源码版",
+    "notes": "修复公共取码页的邮箱类型识别和表单对齐，域名邮箱现在按系统中已启用的接收域名精确判断。请重新下载最新源代码，并按照 README 重新构建和启动。",
+    "published_at": "2026-08-30T20:05:00+08:00",
     "url": "https://github.com/xiuxiu56/iCloud-Privacy-Mail-v2/archive/refs/heads/main.zip"
   },
   "announcements": [
+    {
+      "id": "source-version-2-2-1",
+      "type": "update",
+      "title": "2.2.1 公共取码页体验修复已更新",
+      "summary": "域名邮箱类型判断与输入框、操作按钮的水平对齐已修复。",
+      "content": "获取验证码与邮件页面现在从公共状态接口读取已启用的接收域名，输入邮箱命中配置后正确显示“域名邮箱”，未命中时显示“iCloud 隐私邮箱”。公共接口只返回域名名称，不暴露接收邮箱、IMAP 配置或凭据。同时移除输入框下方的重复域名说明，并统一标题徽标、输入框与操作按钮的垂直对齐。",
+      "published_at": "2026-08-30T20:05:00+08:00",
+      "url": "https://github.com/xiuxiu56/iCloud-Privacy-Mail-v2/archive/refs/heads/main.zip"
+    },
     {
       "id": "source-version-2-2-0",
       "type": "update",
