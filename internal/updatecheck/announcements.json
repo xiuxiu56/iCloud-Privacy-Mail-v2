@@ -1,13 +1,22 @@
 {
   "schema_version": 1,
   "latest": {
-    "version": "2.1.2",
-    "name": "2.1.2 源码版",
-    "notes": "新增 iCloud Web API 分场景开关，取码与邮件刷新渠道默认关闭，并压缩后台监听状态提示。请重新下载最新源代码，并按照 README 重新构建和启动。",
-    "published_at": "2026-08-29T22:30:00+08:00",
+    "version": "2.2.0",
+    "name": "2.2.0 源码版",
+    "notes": "新增域名邮箱收件系统，支持地址生成、双通道同步、外部 API 取码与云端邮件删除。请重新下载最新源代码，并按照 README 重新构建和启动。",
+    "published_at": "2026-08-30T00:00:00+08:00",
     "url": "https://github.com/xiuxiu56/iCloud-Privacy-Mail-v2/archive/refs/heads/main.zip"
   },
   "announcements": [
+    {
+      "id": "source-version-2-2-0",
+      "type": "update",
+      "title": "2.2.0 域名邮箱收件系统已更新",
+      "summary": "域名邮箱登记、双通道收件、外部 API 与云端删除流程已完善。",
+      "content": "新增域名邮箱地址生成与管理页面，复用 iCloud IMAP 和 Web API 双通道收件。首次同步扫描当前全部邮件，后续通过 UID 游标增量扫描，并使用共享 IMAP 索引和自动修补减少漏信与重复扫描。外部 API 支持通过 mailbox_kind=domain_forward 领取域名邮箱、查询邮件和获取验证码。删除时按原始收件人定位主号邮件，完成云端删除后再清理本地邮件和地址登记。",
+      "published_at": "2026-08-30T00:00:00+08:00",
+      "url": "https://github.com/xiuxiu56/iCloud-Privacy-Mail-v2/archive/refs/heads/main.zip"
+    },
     {
       "id": "source-version-2-1-2",
       "type": "update",

@@ -106,10 +106,10 @@ data/app.db.key
 {
   "schema_version": 1,
   "latest": {
-    "version": "2.1.2",
-    "name": "2.1.2 源码版",
-    "notes": "新增 iCloud Web API 分场景开关，请重新下载最新源代码并按文档重新构建",
-    "published_at": "2026-08-29T22:30:00+08:00",
+    "version": "2.2.0",
+    "name": "2.2.0 源码版",
+    "notes": "新增域名邮箱收件系统，请重新下载最新源代码并按文档重新构建",
+    "published_at": "2026-08-30T00:00:00+08:00",
     "url": "https://github.com/xiuxiu56/iCloud-Privacy-Mail-v2/archive/refs/heads/main.zip"
   },
   "announcements": []
