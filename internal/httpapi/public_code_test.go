@@ -63,6 +63,56 @@ func TestPublicCodePageMessagesRequireEnabledSetting(t *testing.T) {
 	}
 }
 
+func TestPublicCodePageStatusReturnsConfiguredDomainNames(t *testing.T) {
+	server, state, _ := newPublicCodeTestServer(t, true)
+	domainSettings := domain.DefaultDomainMailSettings()
+	domainSettings.Enabled = true
+	_, _, err := state.SaveDomainMailConfig(domainSettings, []domain.DomainMailRoute{
+		{
+			Domain:         "xiummm.com",
+			ReceiverType:   domain.DomainReceiverCustomIMAP,
+			ForwardToEmail: "receiver@example.net",
+			IMAPHost:       "imap.example.net",
+			IMAPPort:       993,
+			IMAPUsername:   "receiver@example.net",
+			IMAPPassword:   "fixture-password",
+			IMAPTLS:        true,
+		},
+		{
+			Domain:         "mail.example.org",
+			ReceiverType:   domain.DomainReceiverCustomIMAP,
+			ForwardToEmail: "receiver@example.org",
+			IMAPHost:       "imap.example.org",
+			IMAPPort:       993,
+			IMAPUsername:   "receiver@example.org",
+			IMAPPassword:   "fixture-password",
+			IMAPTLS:        true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("保存域名邮箱测试配置失败：%v", err)
+	}
+
+	response := publicCodeTestRequest(t, server, "/api/v1/public-code/status")
+	if response.Code != http.StatusOK {
+		t.Fatalf("公共页面状态接口状态码为 %d：%s", response.Code, response.Body.String())
+	}
+	data := publicCodeTestData(t, response)
+	domainMail, ok := data["domain_mail"].(map[string]any)
+	if !ok || domainMail["enabled"] != true {
+		t.Fatalf("公共页面状态没有返回已启用的域名邮箱配置：%+v", data)
+	}
+	domains, ok := domainMail["domains"].([]any)
+	if !ok || len(domains) != 2 || domains[0] != "mail.example.org" || domains[1] != "xiummm.com" {
+		t.Fatalf("公共页面状态返回的接收域名不正确：%+v", domainMail)
+	}
+	for _, forbidden := range []string{"receiver@example.net", "imap.example.net", "fixture-password"} {
+		if strings.Contains(response.Body.String(), forbidden) {
+			t.Fatalf("公共页面状态暴露了收件账号配置：%s", forbidden)
+		}
+	}
+}
+
 func TestPublicMailboxMessageAPIUsesMailboxTokenAndReturnsKind(t *testing.T) {
 	state, err := store.Open(filepath.Join(t.TempDir(), "app.db"))
 	if err != nil {

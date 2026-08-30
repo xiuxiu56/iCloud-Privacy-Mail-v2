@@ -3,7 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { AlertCircle, AtSign, Check, ChevronRight, ClipboardCopy, Cloud, Inbox, KeyRound, LoaderCircle, Mail, MailOpen, Moon, RefreshCw, Sun, X } from '@lucide/vue'
 import { api } from '../api/client'
 import { useToast } from '../composables/useToast'
-import { domainRouteForEmail, loadDomainMailPreview, matchesDomainMailPreview } from '../domainMailPreview'
+import { domainRouteForEmail, loadDomainMailPreview, matchesDomainMailPreview, normalizeDomainMailPreview } from '../domainMailPreview'
 
 const { success: showSuccess, error: showError } = useToast()
 
@@ -62,7 +62,7 @@ function mailboxMeta(value) {
   const target = String(value || '').trim().toLowerCase()
   const domainRoute = domainRouteForEmail(target, domainConfig.value)
   if (matchesDomainMailPreview(target, domainConfig.value) && domainRoute) {
-    return { label: '域名邮箱', description: `通过 ${domainRoute.forward_to_email || '已配置接收邮箱'} 接收`, kind: 'domain' }
+    return { label: '域名邮箱', description: `已匹配系统配置的接收域名 @${domainRoute.domain}`, kind: 'domain' }
   }
   return { label: 'iCloud 隐私邮箱', description: '从已绑定 Apple 账号查询', kind: 'icloud' }
 }
@@ -169,6 +169,7 @@ async function loadStatus() {
   try {
     const data = await api('/api/v1/public-code/status')
     enabled.value = Boolean(data.enabled)
+    domainConfig.value = normalizeDomainMailPreview(data.domain_mail || {})
   } catch (err) {
     enabled.value = false
     mailError.value = err.message

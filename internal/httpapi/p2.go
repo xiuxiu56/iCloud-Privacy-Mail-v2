@@ -406,11 +406,24 @@ func (s *Server) publicAPIMailbox(w http.ResponseWriter, r *http.Request) (domai
 
 func (s *Server) handlePublicCodePageStatus(w http.ResponseWriter, _ *http.Request) {
 	settings := s.store.Settings()
+	domainSettings := s.store.DomainMailSettings()
+	domains := make([]string, 0)
+	if domainSettings.Enabled {
+		for _, route := range s.store.DomainMailRoutes() {
+			if route.Enabled && strings.TrimSpace(route.Domain) != "" {
+				domains = append(domains, strings.ToLower(strings.TrimSpace(route.Domain)))
+			}
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"success": true,
 		"data": map[string]any{
 			"enabled": settings.EnablePublicCodePage,
 			"route":   "/email-code",
+			"domain_mail": map[string]any{
+				"enabled": domainSettings.Enabled,
+				"domains": domains,
+			},
 		},
 	})
 }
