@@ -294,8 +294,6 @@ type AppleMailCleanupJob struct {
 	Failed              int                       `json:"failed"`
 	CurrentAccountID    string                    `json:"current_account_id,omitempty"`
 	CurrentAppleID      string                    `json:"current_apple_id,omitempty"`
-	CurrentFolder       string                    `json:"current_folder,omitempty"`
-	FoldersScanned      int                       `json:"folders_scanned"`
 	Discovered          int                       `json:"discovered"`
 	MovedToTrash        int                       `json:"moved_to_trash"`
 	Destroyed           int                       `json:"destroyed"`
@@ -929,23 +927,33 @@ func (s *Service) StartAppleMailCleanup(parent context.Context, request AppleMai
 	}
 	request.Scope = strings.ToLower(strings.TrimSpace(request.Scope))
 	if request.Scope == "" {
-		request.Scope = "all"
+		request.Scope = "mailbox_index"
 	}
-	if request.Scope != "all" {
-		return AppleMailCleanupJob{}, errors.New("当前只支持清理全部 Apple 云端邮件")
+	if request.Scope != "mailbox_index" {
+		return AppleMailCleanupJob{}, errors.New("当前只支持按邮箱池已同步邮件清理")
 	}
 	request.Strategy = strings.ToLower(strings.TrimSpace(request.Strategy))
 	if request.Strategy == "" {
-		request.Strategy = "move_then_destroy"
+		request.Strategy = "move_then_empty_trash"
 	}
-	if request.Strategy != "move_then_destroy" {
-		return AppleMailCleanupJob{}, errors.New("当前只支持先移入废纸篓再彻底删除")
+	if request.Strategy != "move_then_empty_trash" {
+		return AppleMailCleanupJob{}, errors.New("当前只支持按邮箱索引移入废纸篓后彻底清理")
 	}
 	accountIDs, err := s.cleanupAccountIDs(request.AccountIDs)
 	if err != nil {
 		return AppleMailCleanupJob{}, err
 	}
 	mailboxCounts, totalMailboxes := s.cleanupMailboxCounts(accountIDs)
+	filteredAccountIDs := make([]string, 0, len(accountIDs))
+	for _, accountID := range accountIDs {
+		if mailboxCounts[accountID] > 0 {
+			filteredAccountIDs = append(filteredAccountIDs, accountID)
+		}
+	}
+	accountIDs = filteredAccountIDs
+	if totalMailboxes == 0 {
+		return AppleMailCleanupJob{}, errors.New("邮箱池中没有可清理的 iCloud 隐私邮箱")
+	}
 	if parent == nil {
 		parent = context.Background()
 	}
@@ -953,7 +961,7 @@ func (s *Service) StartAppleMailCleanup(parent context.Context, request AppleMai
 	s.cleanupMu.Lock()
 	defer s.cleanupMu.Unlock()
 	if s.cleanupState.Running {
-		return AppleMailCleanupJob{}, errors.New("全部 Apple 邮件清理任务正在运行")
+		return AppleMailCleanupJob{}, errors.New("邮箱池 Apple 邮件清理任务正在运行")
 	}
 	ctx, cancel := context.WithCancel(parent)
 	s.cleanupCancel = cancel
@@ -1003,11 +1011,10 @@ func (s *Service) CancelAppleMailCleanup(message string) AppleMailCleanupJob {
 	s.cleanupState.Stage = "cancelled"
 	s.cleanupState.Active = 0
 	s.cleanupState.Queued = 0
-	s.cleanupState.CurrentFolder = ""
 	s.cleanupState.UpdatedAt = now
 	s.cleanupState.CompletedAt = now
 	if strings.TrimSpace(message) == "" {
-		message = "全部 Apple 邮件清理任务已取消"
+		message = "邮箱池 Apple 邮件清理任务已取消"
 	}
 	s.cleanupState.LastError = strings.TrimSpace(message)
 	s.publishAppleMailCleanupLocked()
@@ -1015,6 +1022,10 @@ func (s *Service) CancelAppleMailCleanup(message string) AppleMailCleanupJob {
 }
 
 func (s *Service) runAppleMailCleanup(ctx context.Context, request AppleMailCleanupRequest, accountIDs []string, generation uint64) {
+	client := s.deleteClient
+	if client == nil {
+		client = s.client
+	}
 	for index, accountID := range accountIDs {
 		if ctx.Err() != nil || !s.beginAppleMailCleanupAccount(generation, accountID, len(accountIDs)-index-1) {
 			return
@@ -1026,29 +1037,83 @@ func (s *Service) runAppleMailCleanup(ctx context.Context, request AppleMailClea
 			continue
 		}
 		base := s.appleMailCleanupTotals(generation)
-		_, cleanupErr := s.client.CleanAllRemoteMail(ctx, session, func(progress protocol.ICloudAllMailCleanupProgress) {
-			s.updateAppleMailCleanupProgress(generation, base, progress)
+		mailboxes := s.cleanupMailboxesForAccount(accountID)
+		cleanup, cleanupErr := s.cleanAppleMailboxPoolAccount(ctx, client, session, mailboxes, request.PurgeLocal, func(stage string, discovered int, result protocol.ICloudMailCleanupResult) {
+			s.updateAppleMailCleanupProgress(generation, base, stage, discovered, result)
 		})
-		localRemoved := 0
-		if cleanupErr == nil && request.PurgeLocal {
-			localRemoved, cleanupErr = s.store.DeleteAccountMessages(accountID)
-			if cleanupErr != nil {
-				cleanupErr = fmt.Errorf("Apple 云端邮件已清理，但本地邮件清理失败：%w", cleanupErr)
-			}
-		}
 		if ctx.Err() != nil {
 			return
 		}
-		s.finishAppleMailCleanupAccount(generation, accountID, account.AppleID, localRemoved, cleanupErr)
+		s.finishAppleMailCleanupAccount(generation, accountID, account.AppleID, cleanup.LocalRemoved, cleanupErr)
 	}
 	s.finishAppleMailCleanupJob(generation)
 }
 
+// cleanAppleMailboxPoolAccount 复用单个邮箱彻底删除前的邮件清理规则，
+// 但会把同一 Apple 账号下的远端标识合并为一批，避免按邮箱重复请求。
+func (s *Service) cleanAppleMailboxPoolAccount(ctx context.Context, client remoteMailboxDeleteClient, session protocol.ICloudSession, mailboxes []domain.Mailbox, purgeLocal bool, report func(string, int, protocol.ICloudMailCleanupResult)) (protocol.ICloudMailCleanupResult, error) {
+	result := protocol.ICloudMailCleanupResult{}
+	indexedRemoteIDs := make([]string, 0)
+	for _, mailbox := range mailboxes {
+		indexedRemoteIDs = append(indexedRemoteIDs, remoteMessageIDs(s.store.MessagesForMailbox(mailbox.ID))...)
+	}
+	indexedRemoteIDs = uniqueStrings(indexedRemoteIDs)
+	if report != nil {
+		report("locating", len(indexedRemoteIDs), result)
+	}
+
+	if len(indexedRemoteIDs) > 0 {
+		moved, err := client.MoveRemoteMessagesToTrash(ctx, session, indexedRemoteIDs)
+		result.MovedToTrash += moved.MovedToTrash
+		result.Skipped += moved.Skipped
+		result.MovedRemoteIDs = append(result.MovedRemoteIDs, moved.MovedRemoteIDs...)
+		result.AbsentRemoteIDs = append(result.AbsentRemoteIDs, moved.AbsentRemoteIDs...)
+		if report != nil {
+			report("moving", len(indexedRemoteIDs), result)
+		}
+		if err != nil {
+			return result, err
+		}
+
+		destroyed, err := client.EmptyTrash(ctx, session)
+		result.Destroyed += destroyed
+		if report != nil {
+			report("destroying", len(indexedRemoteIDs), result)
+		}
+		if err != nil {
+			return result, err
+		}
+		if err := s.store.DeleteMailIndexByRemoteIDs(firstNonEmpty(session.AccountID, mailboxes[0].AccountID), indexedRemoteIDs); err != nil {
+			return result, fmt.Errorf("Apple 远端邮件已清理，但本地邮件索引清理失败：%w", err)
+		}
+	}
+
+	confirmedRemoteIDs := uniqueStrings(append(append([]string(nil), result.MovedRemoteIDs...), result.AbsentRemoteIDs...))
+	for _, mailbox := range mailboxes {
+		var (
+			removed int
+			err     error
+		)
+		if purgeLocal {
+			removed, err = s.store.DeleteMailboxMessages(mailbox.ID)
+		} else {
+			removed, err = s.store.DeleteMailboxMessagesByRemoteIDs(mailbox.ID, confirmedRemoteIDs)
+		}
+		if err != nil {
+			return result, fmt.Errorf("清理邮箱 %s 的本地邮件失败：%w", mailbox.Email, err)
+		}
+		result.LocalRemoved += removed
+	}
+	if report != nil {
+		report("local-cleaned", len(indexedRemoteIDs), result)
+	}
+	return result, nil
+}
+
 type appleMailCleanupTotals struct {
-	FoldersScanned int
-	Discovered     int
-	MovedToTrash   int
-	Destroyed      int
+	Discovered   int
+	MovedToTrash int
+	Destroyed    int
 }
 
 func (s *Service) appleMailCleanupTotals(generation uint64) appleMailCleanupTotals {
@@ -1058,10 +1123,9 @@ func (s *Service) appleMailCleanupTotals(generation uint64) appleMailCleanupTota
 		return appleMailCleanupTotals{}
 	}
 	return appleMailCleanupTotals{
-		FoldersScanned: s.cleanupState.FoldersScanned,
-		Discovered:     s.cleanupState.Discovered,
-		MovedToTrash:   s.cleanupState.MovedToTrash,
-		Destroyed:      s.cleanupState.Destroyed,
+		Discovered:   s.cleanupState.Discovered,
+		MovedToTrash: s.cleanupState.MovedToTrash,
+		Destroyed:    s.cleanupState.Destroyed,
 	}
 }
 
@@ -1073,29 +1137,26 @@ func (s *Service) beginAppleMailCleanupAccount(generation uint64, accountID stri
 	}
 	account, _ := s.store.FindAppleAccount(accountID)
 	s.cleanupState.Status = "running"
-	s.cleanupState.Stage = "scanning"
+	s.cleanupState.Stage = "locating"
 	s.cleanupState.Active = 1
 	s.cleanupState.Queued = queued
 	s.cleanupState.CurrentAccountID = accountID
 	s.cleanupState.CurrentAppleID = account.AppleID
-	s.cleanupState.CurrentFolder = ""
 	s.cleanupState.UpdatedAt = time.Now()
 	s.publishAppleMailCleanupLocked()
 	return true
 }
 
-func (s *Service) updateAppleMailCleanupProgress(generation uint64, base appleMailCleanupTotals, progress protocol.ICloudAllMailCleanupProgress) {
+func (s *Service) updateAppleMailCleanupProgress(generation uint64, base appleMailCleanupTotals, stage string, discovered int, progress protocol.ICloudMailCleanupResult) {
 	s.cleanupMu.Lock()
 	defer s.cleanupMu.Unlock()
 	if generation != s.cleanupGeneration || !s.cleanupState.Running {
 		return
 	}
-	s.cleanupState.Stage = progress.Stage
-	s.cleanupState.CurrentFolder = progress.Folder
-	s.cleanupState.FoldersScanned = base.FoldersScanned + progress.Result.FoldersScanned
-	s.cleanupState.Discovered = base.Discovered + progress.Result.Discovered
-	s.cleanupState.MovedToTrash = base.MovedToTrash + progress.Result.MovedToTrash
-	s.cleanupState.Destroyed = base.Destroyed + progress.Result.Destroyed
+	s.cleanupState.Stage = stage
+	s.cleanupState.Discovered = base.Discovered + discovered
+	s.cleanupState.MovedToTrash = base.MovedToTrash + progress.MovedToTrash
+	s.cleanupState.Destroyed = base.Destroyed + progress.Destroyed
 	s.cleanupState.UpdatedAt = time.Now()
 	s.publishAppleMailCleanupLocked()
 }
@@ -1111,7 +1172,6 @@ func (s *Service) finishAppleMailCleanupAccount(generation uint64, accountID, ap
 	s.cleanupState.CompletedMailboxes += mailboxCount
 	s.cleanupState.Active = 0
 	s.cleanupState.LocalRemoved += localRemoved
-	s.cleanupState.CurrentFolder = ""
 	s.cleanupState.UpdatedAt = time.Now()
 	if cleanupErr != nil {
 		s.cleanupState.Failed++
@@ -1139,7 +1199,6 @@ func (s *Service) finishAppleMailCleanupJob(generation uint64) {
 	s.cleanupState.Queued = 0
 	s.cleanupState.CurrentAccountID = ""
 	s.cleanupState.CurrentAppleID = ""
-	s.cleanupState.CurrentFolder = ""
 	s.cleanupState.CompletedAt = now
 	s.cleanupState.UpdatedAt = now
 	s.cleanupCancel = nil
@@ -1193,12 +1252,22 @@ func (s *Service) cleanupMailboxCounts(accountIDs []string) (map[string]int, int
 	counts := make(map[string]int, len(selected))
 	total := 0
 	for _, mailbox := range s.store.AllMailboxes() {
-		if selected[mailbox.AccountID] {
+		if selected[mailbox.AccountID] && mailboxKind(mailbox) == domain.MailboxKindICloudHME {
 			counts[mailbox.AccountID]++
 			total++
 		}
 	}
 	return counts, total
+}
+
+func (s *Service) cleanupMailboxesForAccount(accountID string) []domain.Mailbox {
+	out := make([]domain.Mailbox, 0)
+	for _, mailbox := range s.store.AllMailboxes() {
+		if mailbox.AccountID == accountID && mailboxKind(mailbox) == domain.MailboxKindICloudHME {
+			out = append(out, mailbox)
+		}
+	}
+	return out
 }
 
 func (s *Service) publishAppleMailCleanupLocked() {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -28,6 +29,7 @@ type remoteMailboxDeleteClientFixture struct {
 	emptyTrashErr error
 	onDelete      func()
 	onMove        func()
+	onEmptyTrash  func()
 }
 
 func (f *remoteMailboxDeleteClientFixture) ListPrivacyMailboxes(context.Context, protocol.ICloudSession) ([]protocol.ICloudRemoteMailbox, error) {
@@ -271,6 +273,9 @@ func TestDeleteDomainMailboxTreatsZeroAsEmptyOnlyAfterIMAPHistoryIsComplete(t *t
 
 func (f *remoteMailboxDeleteClientFixture) EmptyTrash(context.Context, protocol.ICloudSession) (int, error) {
 	f.operations = append(f.operations, "清空远端废纸篓")
+	if f.onEmptyTrash != nil {
+		f.onEmptyTrash()
+	}
 	if f.emptyTrashErr != nil {
 		return 0, f.emptyTrashErr
 	}
@@ -433,6 +438,115 @@ func TestCleanRemoteMailboxesPurgesAllLocalMessages(t *testing.T) {
 	if !reflect.DeepEqual(client.remoteIDs, []string{"icloud:Inbox:101"}) {
 		t.Fatalf("远端邮件标识不正确：%v", client.remoteIDs)
 	}
+}
+
+func TestAppleMailCleanupUsesMailboxPoolIndexesAndKeepsMailbox(t *testing.T) {
+	state, mailbox := newDeleteServiceFixture(t)
+	secondMailbox, _, err := state.UpsertMailboxFromRemote(mailbox.AccountID, domain.RemoteMailbox{
+		AnonymousID: "anonymous-cleanup-second", Email: "cleanup-second@icloud.com", Label: "cleanup_second", IsActive: true,
+	}, "邮箱池清理合并测试")
+	if err != nil {
+		t.Fatalf("创建第二个邮箱池清理测试邮箱失败：%v", err)
+	}
+	if _, _, err := state.UpsertMessage(secondMailbox.ID, "imap:102", "imap", "验证码 102", "sender@example.com", "102", time.Now()); err != nil {
+		t.Fatalf("保存第二个邮箱池清理测试邮件失败：%v", err)
+	}
+	_, routes, err := state.SaveDomainMailConfig(domain.DefaultDomainMailSettings(), []domain.DomainMailRoute{{
+		Domain: "cleanup.example", ReceiverType: domain.DomainReceiverAppleAccount,
+		AccountID: mailbox.AccountID, ForwardToEmail: "delete-fixture@icloud.com",
+	}})
+	if err != nil || len(routes) != 1 {
+		t.Fatalf("创建域名邮箱清理隔离测试路由失败：routes=%+v err=%v", routes, err)
+	}
+	domainMailboxes, err := state.CreateDomainMailboxes(routes[0].ID, []string{"keep@cleanup.example"}, "域名邮箱", "", true)
+	if err != nil || len(domainMailboxes) != 1 {
+		t.Fatalf("创建域名邮箱清理隔离测试数据失败：mailboxes=%+v err=%v", domainMailboxes, err)
+	}
+	if _, _, err := state.UpsertMessage(domainMailboxes[0].ID, "icloud:Inbox:999", "icloud", "域名邮件", "sender@example.com", "保留", time.Now()); err != nil {
+		t.Fatalf("保存域名邮箱清理隔离测试邮件失败：%v", err)
+	}
+	client := &remoteMailboxDeleteClientFixture{}
+	client.onMove = func() {
+		if firstCount, secondCount := len(state.MessagesForMailbox(mailbox.ID)), len(state.MessagesForMailbox(secondMailbox.ID)); firstCount != 2 || secondCount != 1 {
+			t.Errorf("Apple 云端邮件移动完成前，本地邮件应保留：first=%d second=%d", firstCount, secondCount)
+		}
+	}
+	client.onEmptyTrash = func() {
+		if firstCount, secondCount := len(state.MessagesForMailbox(mailbox.ID)), len(state.MessagesForMailbox(secondMailbox.ID)); firstCount != 2 || secondCount != 1 {
+			t.Errorf("Apple 废纸篓清理完成前，本地邮件应保留：first=%d second=%d", firstCount, secondCount)
+		}
+	}
+	service := NewService(config.Config{}, state)
+	service.deleteClient = client
+
+	job, err := service.StartAppleMailCleanup(context.Background(), AppleMailCleanupRequest{PurgeLocal: true})
+	if err != nil {
+		t.Fatalf("启动邮箱池邮件清理失败：%v", err)
+	}
+	job = waitAppleMailCleanup(t, service, job)
+
+	if !reflect.DeepEqual(client.operations, []string{"移动远端邮件", "清空远端废纸篓"}) {
+		t.Fatalf("邮箱池清理不应扫描 Apple 文件夹：%v", client.operations)
+	}
+	remoteIDs := append([]string(nil), client.remoteIDs...)
+	sort.Strings(remoteIDs)
+	if !reflect.DeepEqual(remoteIDs, []string{"icloud:Inbox:101", "imap:102"}) {
+		t.Fatalf("邮箱池清理未使用已同步的远端标识：%v", client.remoteIDs)
+	}
+	if job.Status != "completed" || job.TotalMailboxes != 2 || job.SuccessfulMailboxes != 2 || job.Discovered != 2 || job.MovedToTrash != 2 || job.Destroyed != 1 || job.LocalRemoved != 3 {
+		t.Fatalf("邮箱池清理统计不正确：%+v", job)
+	}
+	if _, found := state.FindMailboxByID(mailbox.ID); !found {
+		t.Fatal("全部清理邮件后应保留隐私邮箱地址")
+	}
+	if _, found := state.FindMailboxByID(secondMailbox.ID); !found {
+		t.Fatal("全部清理邮件后应保留第二个隐私邮箱地址")
+	}
+	if messages := state.MessagesForMailbox(mailbox.ID); len(messages) != 0 {
+		t.Fatalf("Apple 云端清理成功后，本地邮件仍然存在：%d", len(messages))
+	}
+	if messages := state.MessagesForMailbox(secondMailbox.ID); len(messages) != 0 {
+		t.Fatalf("Apple 云端清理成功后，第二个邮箱的本地邮件仍然存在：%d", len(messages))
+	}
+	if messages := state.MessagesForMailbox(domainMailboxes[0].ID); len(messages) != 1 {
+		t.Fatalf("邮箱池清理不应处理域名邮箱邮件：%d", len(messages))
+	}
+}
+
+func TestAppleMailCleanupKeepsLocalMessagesWhenTrashCleanupFails(t *testing.T) {
+	state, mailbox := newDeleteServiceFixture(t)
+	client := &remoteMailboxDeleteClientFixture{emptyTrashErr: errors.New("清理废纸篓测试失败")}
+	service := NewService(config.Config{}, state)
+	service.deleteClient = client
+
+	job, err := service.StartAppleMailCleanup(context.Background(), AppleMailCleanupRequest{PurgeLocal: true})
+	if err != nil {
+		t.Fatalf("启动邮箱池邮件清理失败：%v", err)
+	}
+	job = waitAppleMailCleanup(t, service, job)
+
+	if job.Status != "partial" || job.FailedMailboxes != 1 || !strings.Contains(job.LastError, "清理废纸篓测试失败") {
+		t.Fatalf("远端清理失败状态不正确：%+v", job)
+	}
+	if _, found := state.FindMailboxByID(mailbox.ID); !found {
+		t.Fatal("远端清理失败时应保留隐私邮箱地址")
+	}
+	if messages := state.MessagesForMailbox(mailbox.ID); len(messages) != 2 {
+		t.Fatalf("远端清理失败时应保留本地邮件：%d", len(messages))
+	}
+}
+
+func waitAppleMailCleanup(t *testing.T, service *Service, job AppleMailCleanupJob) AppleMailCleanupJob {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for job.Running && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+		job = service.AppleMailCleanupStatus()
+	}
+	if job.Running {
+		t.Fatal("等待邮箱池邮件清理任务完成超时")
+	}
+	return job
 }
 
 func newDomainDeleteServiceFixture(t *testing.T, count int) (*store.Store, []domain.Mailbox) {

@@ -384,38 +384,6 @@ function cleanupText(cleanup) {
   return `移动 ${moved} 封，彻底清除 ${destroyed} 封${localRemoved ? `，本地清理 ${localRemoved} 封` : ''}${skipped ? `，未匹配 ${skipped} 封` : ''}`
 }
 
-function appleMailFolderText(value) {
-  const name = String(value || '').trim()
-  if (!name) return ''
-  const normalized = name.toLowerCase()
-  const categoryMarker = '$category$_'
-  const categoryIndex = normalized.indexOf(categoryMarker)
-  if (categoryIndex >= 0) {
-    let category = normalized.slice(categoryIndex + categoryMarker.length)
-    const highlighted = category.endsWith('_hi')
-    if (highlighted) category = category.slice(0, -3)
-    let label = ({ primary: '主要', decluttered: '智能整理', personal: '个人', transactions: '交易', updates: '更新', news: '新闻', social: '社交', others: '其他', promotions: '推广', error: '分类异常', unsupportedlanguage: '不支持的语言' })[category] || '智能分类'
-    if (highlighted) label += '·重点'
-    return `收件箱（${label}）`
-  }
-  return ({
-    inbox: '收件箱',
-    sent: '已发送',
-    'sent mail': '已发送',
-    'sent messages': '已发送',
-    drafts: '草稿箱',
-    archive: '归档',
-    junk: '垃圾邮件',
-    'junk mail': '垃圾邮件',
-    'bulk mail': '垃圾邮件',
-    spam: '垃圾邮件',
-    trash: '废纸篓',
-    deleted: '废纸篓',
-    'deleted messages': '废纸篓',
-    'all mail': '所有邮件',
-  })[normalized] || name
-}
-
 function appleMailCleanupText(job) {
   const total = Number(job?.total_accounts || 0)
   const totalMailboxes = Number(job?.total_mailboxes || 0)
@@ -427,12 +395,11 @@ function appleMailCleanupText(job) {
   const completedMailboxes = Number(job?.completed_mailboxes || 0)
   const successfulMailboxes = Number(job?.successful_mailboxes || 0)
   const failedMailboxes = Number(job?.failed_mailboxes || 0)
-  const folder = job?.current_folder ? `｜当前文件夹 ${appleMailFolderText(job.current_folder)}` : ''
   const progress = totalMailboxes > 0
     ? `邮箱已完成 ${completedMailboxes}/${totalMailboxes}（成功 ${successfulMailboxes}，失败 ${failedMailboxes}）`
     : `账号已完成 ${completedAccounts}/${total}（成功 ${successfulAccounts}，失败 ${failedAccounts}）`
-  const counts = `发现邮件 ${job?.discovered || 0}｜移入废纸篓 ${job?.moved_to_trash || 0}｜彻底删除 ${job?.destroyed || 0}｜本地清理 ${job?.local_removed || 0}`
-  return `全部邮件清理：Apple 账号 ${total}｜邮箱 ${totalMailboxes}｜执行账号 ${active}｜排队账号 ${queued}｜${progress}${folder}；${counts}`
+  const counts = `目标邮件 ${job?.discovered || 0}｜移入废纸篓 ${job?.moved_to_trash || 0}｜彻底删除 ${job?.destroyed || 0}｜本地清理 ${job?.local_removed || 0}`
+  return `邮箱池邮件清理：Apple 账号 ${total}｜邮箱 ${totalMailboxes}｜执行账号 ${active}｜排队账号 ${queued}｜${progress}；${counts}`
 }
 
 function applyAppleMailCleanupJob(job, showCompleted = true) {
@@ -445,7 +412,7 @@ function applyAppleMailCleanupJob(job, showCompleted = true) {
   }
   if (!showCompleted && !wasRunning) return
   if (job.status === 'completed') {
-    const completedText = Number(job.discovered || 0) > 0 ? '全部 Apple 云端邮件已清理完成' : '未发现需要清理的 Apple 邮件，邮箱状态已确认'
+    const completedText = Number(job.discovered || 0) > 0 ? '邮箱池对应的 Apple 云端与本地邮件已清理完成' : '没有已同步的远端邮件，本地邮件已清理完成'
     cleanAllNoticeID = updateToast(cleanAllNoticeID, `${appleMailCleanupText(job)}；${completedText}`, 'success', 7000)
   } else if (job.status === 'partial') {
     cleanAllNoticeID = updateToast(cleanAllNoticeID, `${appleMailCleanupText(job)}；部分账号失败：${job.last_error || '请查看失败账号'}`, 'warning', 9000)
@@ -1116,10 +1083,10 @@ async function cleanAllAppleMail() {
   if (isBusy('clean-summary') || isBusy('clean-start') || appleMailCleanup.value.running) return
   startBusy('clean-summary')
   try {
-    const dashboard = await api('/api/dashboard')
+    const summary = await api('/api/mailboxes?page=1&page_size=1')
     const confirmed = await confirmAction({
       title: '全部彻底清理 Apple 邮件',
-      message: `清理范围：Apple 账号 ${dashboard.apple_account_count || 0} 个，本地邮件 ${dashboard.message_count || 0} 封。将逐个扫描每个账号的收件箱、已发送、草稿、归档、垃圾邮件和自定义文件夹，把全部 Apple 云端邮件移入废纸篓后彻底删除，再清理本地邮件数据。隐私邮箱地址本身会保留，此操作不可恢复。`,
+      message: `清理范围：邮箱池中的 ${summary.total || 0} 个 iCloud 隐私邮箱。将按照单行删除相同的邮件清理规则，只使用列表邮箱已同步保存的远端标识，按 Apple 账号合并后移入废纸篓并彻底清理，成功后删除对应本地邮件；不会扫描收件箱、已发送、草稿、归档等其他文件夹，隐私邮箱地址本身会保留。`,
       confirmText: '确认全部清理',
       tone: 'danger',
     })
@@ -1128,7 +1095,7 @@ async function cleanAllAppleMail() {
     startBusy('clean-start')
     const data = await api('/api/apple-mail/cleanup', {
       method: 'POST',
-      body: JSON.stringify({ account_ids: [], scope: 'all', strategy: 'move_then_destroy', purge_local: true }),
+      body: JSON.stringify({ account_ids: [], scope: 'mailbox_index', strategy: 'move_then_empty_trash', purge_local: true }),
     })
     applyAppleMailCleanupJob(data.job)
   } catch (err) {
@@ -1376,7 +1343,7 @@ onBeforeUnmount(() => {
           <button type="button" class="secondary-button mailbox-command-button" :disabled="isBusy('sync-existing') || isBusy('sync-existing-messages') || existingMailboxMessageSync.running" @click="openSyncDialog"><LoaderCircle v-if="isBusy('sync-existing')" :size="14" class="animate-spin" /><CloudDownload v-else :size="14" />{{ isBusy('sync-existing') ? '正在同步邮箱' : '同步已有邮箱' }}</button>
           <button type="button" class="secondary-button mailbox-command-button" :disabled="isBusy('sync-existing-messages') || isBusy('sync-existing') || existingMailboxMessageSync.running" title="读取所有 Apple 主号的全部邮件；IMAP 主路径，iCloud Web 补查并自动合并" @click="syncExistingMailboxMessages"><LoaderCircle v-if="isBusy('sync-existing-messages') || existingMailboxMessageSync.running" :size="14" class="animate-spin" /><MailOpen v-else :size="14" />{{ existingMailboxMessageSync.running ? `正在同步 ${existingMailboxMessageSync.completed_accounts || 0}/${existingMailboxMessageSync.total_accounts || 0}` : isBusy('sync-existing-messages') ? '正在启动同步' : '同步已有邮箱邮件' }}</button>
           <button type="button" class="secondary-button mailbox-command-button" :disabled="isBusy('import')" @click="openImportDialog"><LoaderCircle v-if="isBusy('import')" :size="14" class="animate-spin" /><MailPlus v-else :size="14" />{{ isBusy('import') ? '正在导入邮箱' : '导入本地邮箱' }}</button>
-          <button type="button" class="secondary-button mailbox-command-button" :disabled="isBusy('clean-summary') || isBusy('clean-start') || appleMailCleanup.running" title="扫描并彻底删除全部 Apple 账号的云端和本地邮件" @click="cleanAllAppleMail"><LoaderCircle v-if="isBusy('clean-summary') || isBusy('clean-start') || appleMailCleanup.running" :size="14" class="animate-spin" /><CloudOff v-else :size="14" />{{ isBusy('clean-summary') ? '正在统计邮件' : isBusy('clean-start') ? '正在启动清理' : appleMailCleanup.running ? `正在清理 ${appleMailCleanup.completed || 0}/${appleMailCleanup.total_accounts || 0}` : '全部彻底清理 Apple 邮件' }}</button>
+          <button type="button" class="secondary-button mailbox-command-button" :disabled="isBusy('clean-summary') || isBusy('clean-start') || appleMailCleanup.running" title="按邮箱池已同步的远端标识彻底清理 Apple 云端与本地邮件，不扫描其他文件夹" @click="cleanAllAppleMail"><LoaderCircle v-if="isBusy('clean-summary') || isBusy('clean-start') || appleMailCleanup.running" :size="14" class="animate-spin" /><CloudOff v-else :size="14" />{{ isBusy('clean-summary') ? '正在统计邮件' : isBusy('clean-start') ? '正在启动清理' : appleMailCleanup.running ? `正在清理 ${appleMailCleanup.completed_mailboxes || 0}/${appleMailCleanup.total_mailboxes || 0}` : '全部彻底清理 Apple 邮件' }}</button>
           <button type="button" class="secondary-button mailbox-command-button mailbox-command-button-danger" :disabled="isBusy('bulk-delete-resolve')" title="按邮箱地址批量彻底删除 Apple 云端和本地邮箱" @click="openBulkDeleteDialog"><Trash2 :size="14" />批量删除指定邮箱</button>
           <button type="button" class="secondary-button mailbox-command-button mailbox-command-button-danger" :disabled="!selectedDeletableCount || deleteConfirmID === 'selected'" :title="selectedDeletableCount ? `彻底删除选中的 ${selectedDeletableCount} 个邮箱` : '请先选择未进入删除队列的邮箱'" @click="removeSelectedMailboxes"><LoaderCircle v-if="deleteConfirmID === 'selected'" :size="14" class="animate-spin" /><Trash2 v-else :size="14" />删除选中{{ selectedDeletableCount ? `（${selectedDeletableCount}）` : '' }}</button>
         </div>

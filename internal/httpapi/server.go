@@ -870,7 +870,7 @@ func (s *Server) handleAppleMailCleanupStart(w http.ResponseWriter, r *http.Requ
 }
 
 func (s *Server) handleAppleMailCleanupCancel(w http.ResponseWriter, _ *http.Request) {
-	job := s.mailbox.CancelAppleMailCleanup("已手动取消全部 Apple 邮件清理任务")
+	job := s.mailbox.CancelAppleMailCleanup("已手动取消邮箱池 Apple 邮件清理任务")
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": map[string]any{"job": job}})
 }
 

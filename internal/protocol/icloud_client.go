@@ -66,19 +66,6 @@ type ICloudRemoteMessageDiscoveryResult struct {
 	ThreadsScanned     int
 }
 
-type ICloudAllMailCleanupResult struct {
-	FoldersScanned int `json:"folders_scanned"`
-	Discovered     int `json:"discovered"`
-	MovedToTrash   int `json:"moved_to_trash"`
-	Destroyed      int `json:"destroyed"`
-}
-
-type ICloudAllMailCleanupProgress struct {
-	Stage  string                     `json:"stage"`
-	Folder string                     `json:"folder,omitempty"`
-	Result ICloudAllMailCleanupResult `json:"result"`
-}
-
 func NewICloudClient() *ICloudClient {
 	return &ICloudClient{client: &http.Client{Timeout: 30 * time.Second}}
 }
@@ -1615,58 +1602,6 @@ type mailFolder struct {
 	MessageCount int    `json:"messageCount"`
 }
 
-func mailFolderDisplayName(folder mailFolder) string {
-	name := strings.TrimSpace(folder.Name)
-	if name == "" {
-		return strings.TrimSpace(folder.ID)
-	}
-	const categoryMarker = "$category$_"
-	if markerIndex := strings.Index(strings.ToLower(name), categoryMarker); markerIndex >= 0 {
-		category := strings.ToLower(strings.TrimSpace(name[markerIndex+len(categoryMarker):]))
-		highlighted := strings.HasSuffix(category, "_hi")
-		category = strings.TrimSuffix(category, "_hi")
-		labels := map[string]string{
-			"primary":             "主要",
-			"decluttered":         "智能整理",
-			"personal":            "个人",
-			"transactions":        "交易",
-			"updates":             "更新",
-			"news":                "新闻",
-			"social":              "社交",
-			"others":              "其他",
-			"promotions":          "推广",
-			"error":               "分类异常",
-			"unsupportedlanguage": "不支持的语言",
-		}
-		label := labels[category]
-		if label == "" {
-			label = "智能分类"
-		}
-		if highlighted {
-			label += "·重点"
-		}
-		return "收件箱（" + label + "）"
-	}
-	switch strings.ToLower(name) {
-	case "inbox":
-		return "收件箱"
-	case "sent", "sent mail", "sent messages":
-		return "已发送"
-	case "drafts":
-		return "草稿箱"
-	case "archive":
-		return "归档"
-	case "junk", "junk mail", "bulk mail", "spam":
-		return "垃圾邮件"
-	case "trash", "deleted", "deleted messages":
-		return "废纸篓"
-	case "all mail":
-		return "所有邮件"
-	default:
-		return name
-	}
-}
-
 type mailThread struct {
 	ThreadID   string
 	Subject    string
@@ -2311,96 +2246,6 @@ func (c *ICloudClient) EmptyTrash(ctx context.Context, session ICloudSession) (i
 		}
 	}
 	return total, errCode("icloud_trash_not_empty", "废纸篓邮件过多，本次已分批清理一部分，请再点一次", true)
-}
-
-// CleanAllRemoteMail 扫描账号中的全部真实云端邮件，先移入废纸篓，再彻底删除。
-func (c *ICloudClient) CleanAllRemoteMail(ctx context.Context, session ICloudSession, report func(ICloudAllMailCleanupProgress)) (ICloudAllMailCleanupResult, error) {
-	session = normalizeICloudWebSession(session)
-	var result ICloudAllMailCleanupResult
-	if strings.TrimSpace(session.DSID) == "" || len(session.Cookies) == 0 {
-		return result, errCode("icloud_session_missing", "未保存 iCloud Web 登录态，请先使用旧接口登录", true)
-	}
-	folders, err := c.mailFolders(ctx, session)
-	if err != nil {
-		return result, err
-	}
-	trash, ok := trashMailFolder(folders)
-	if !ok || strings.TrimSpace(trash.ID) == "" {
-		return result, errCode("icloud_trash_not_found", "未找到 iCloud 废纸篓文件夹", true)
-	}
-
-	seenFolders := make(map[string]bool)
-	for _, folder := range folders {
-		folder.ID = strings.TrimSpace(folder.ID)
-		folder.Name = strings.TrimSpace(folder.Name)
-		if folder.ID == "" || folder.ID == trash.ID || seenFolders[folder.ID] {
-			continue
-		}
-		seenFolders[folder.ID] = true
-		folderName := mailFolderDisplayName(folder)
-		for batch := 0; ; batch++ {
-			if err := ctx.Err(); err != nil {
-				return result, err
-			}
-			if batch >= 1000 {
-				return result, errCode("icloud_folder_cleanup_limit", "云端文件夹邮件过多，本次清理已达到安全批次上限", true)
-			}
-			identifiers, err := c.mailFolderMessageIdentifiers(ctx, session, folder, 1000)
-			if err != nil {
-				return result, fmt.Errorf("扫描云端文件夹 %s 失败：%w", folderName, err)
-			}
-			if len(identifiers) == 0 {
-				break
-			}
-			result.Discovered += len(identifiers)
-			moved, err := c.moveMailIdentifiersToTrash(ctx, session, identifiers, trash.ID)
-			result.MovedToTrash += moved
-			if report != nil {
-				report(ICloudAllMailCleanupProgress{Stage: "moving", Folder: folderName, Result: result})
-			}
-			if err != nil {
-				return result, fmt.Errorf("清理云端文件夹 %s 失败：%w", folderName, err)
-			}
-			if moved == 0 {
-				return result, errCode("icloud_folder_cleanup_no_progress", "Apple 返回的移动数量为 0，已停止该账号清理以避免重复请求", true)
-			}
-		}
-		result.FoldersScanned++
-		if report != nil {
-			report(ICloudAllMailCleanupProgress{Stage: "folder-completed", Folder: folderName, Result: result})
-		}
-	}
-
-	for batch := 0; ; batch++ {
-		if err := ctx.Err(); err != nil {
-			return result, err
-		}
-		if batch >= 1000 {
-			return result, errCode("icloud_trash_cleanup_limit", "Apple 废纸篓邮件过多，本次清理已达到安全批次上限", true)
-		}
-		identifiers, err := c.mailFolderMessageIdentifiers(ctx, session, trash, 1000)
-		if err != nil {
-			return result, fmt.Errorf("扫描 Apple 废纸篓失败：%w", err)
-		}
-		if len(identifiers) == 0 {
-			break
-		}
-		destroyed, err := c.destroyMailIdentifiers(ctx, session, identifiers)
-		result.Destroyed += destroyed
-		if report != nil {
-			report(ICloudAllMailCleanupProgress{Stage: "destroying", Folder: firstNonEmpty(mailFolderDisplayName(trash), "废纸篓"), Result: result})
-		}
-		if err != nil {
-			return result, fmt.Errorf("彻底清空 Apple 废纸篓失败：%w", err)
-		}
-		if destroyed == 0 {
-			return result, errCode("icloud_trash_cleanup_no_progress", "Apple 返回的彻底删除数量为 0，已停止该账号清理以避免重复请求", true)
-		}
-	}
-	if report != nil {
-		report(ICloudAllMailCleanupProgress{Stage: "completed", Result: result})
-	}
-	return result, nil
 }
 
 type mailEmailObject struct {
