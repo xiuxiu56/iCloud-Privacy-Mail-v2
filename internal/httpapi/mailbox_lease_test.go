@@ -74,6 +74,89 @@ func TestPublicMailboxLeaseLifecycle(t *testing.T) {
 	}
 }
 
+func TestPublicMailboxLeaseDeactivate(t *testing.T) {
+	server, state := newMailboxLeaseTestServer(t)
+	claim := leaseTestRequest(t, server, http.MethodPost, "/api/v1/mailboxes/claim", `{
+		"project":"gpt-register-next",
+		"purpose":"删除账号",
+		"request_id":"delete-account-1"
+	}`)
+	claimData := payloadData(t, decodeLeaseTestPayload(t, claim))
+	leaseID := stringValue(payloadObject(t, claimData, "lease")["id"])
+
+	commit := leaseTestRequest(t, server, http.MethodPost, "/api/v1/mailbox-leases/"+url.PathEscape(leaseID)+"/commit", `{
+		"project":"gpt-register-next",
+		"note":"ChatGPT 注册成功"
+	}`)
+	if commit.Code != http.StatusOK {
+		t.Fatalf("准备停用邮箱时提交租约失败：%d %s", commit.Code, commit.Body.String())
+	}
+
+	deactivate := leaseTestRequest(t, server, http.MethodPost, "/api/v1/mailbox-leases/"+url.PathEscape(leaseID)+"/deactivate", `{
+		"project":"gpt-register-next",
+		"note":"ChatGPT 状态：已停用｜套餐：Free"
+	}`)
+	if deactivate.Code != http.StatusOK {
+		t.Fatalf("停用邮箱接口状态码为 %d：%s", deactivate.Code, deactivate.Body.String())
+	}
+	data := payloadData(t, decodeLeaseTestPayload(t, deactivate))
+	if payloadObject(t, data, "mailbox")["status"] != domain.StatusDisabled {
+		t.Fatalf("停用接口没有返回 disabled：%+v", data)
+	}
+	stored, ok := state.FindMailboxByEmail("lease-api-fixture@icloud.com")
+	if !ok || stored.Status != domain.StatusDisabled || stored.Note != "ChatGPT 状态：已停用｜套餐：Free" {
+		t.Fatalf("停用结果没有持久化：%+v，存在=%t", stored, ok)
+	}
+
+	repeated := leaseTestRequest(t, server, http.MethodPost, "/api/v1/mailbox-leases/"+url.PathEscape(leaseID)+"/deactivate", `{
+		"project":"gpt-register-next",
+		"note":"ChatGPT 状态：已停用｜套餐：Free"
+	}`)
+	if repeated.Code != http.StatusOK || payloadData(t, decodeLeaseTestPayload(t, repeated))["idempotent"] != true {
+		t.Fatalf("重复停用没有保持幂等：%d %s", repeated.Code, repeated.Body.String())
+	}
+}
+
+func TestPublicMailboxLeaseDeactivateFromHistoricalLease(t *testing.T) {
+	server, state := newMailboxLeaseTestServer(t)
+	claim := leaseTestRequest(t, server, http.MethodPost, "/api/v1/mailboxes/claim", `{
+		"project":"gpt-register-next",
+		"purpose":"旧账号",
+		"request_id":"old-account-1"
+	}`)
+	claimData := payloadData(t, decodeLeaseTestPayload(t, claim))
+	oldLeaseID := stringValue(payloadObject(t, claimData, "lease")["id"])
+
+	release := leaseTestRequest(t, server, http.MethodPost, "/api/v1/mailbox-leases/"+url.PathEscape(oldLeaseID)+"/release", `{"project":"gpt-register-next"}`)
+	if release.Code != http.StatusOK {
+		t.Fatalf("释放旧租约失败：%d %s", release.Code, release.Body.String())
+	}
+	newClaim := leaseTestRequest(t, server, http.MethodPost, "/api/v1/mailboxes/claim", `{
+		"project":"gpt-register-next",
+		"purpose":"新账号",
+		"request_id":"new-account-1"
+	}`)
+	if newClaim.Code != http.StatusOK {
+		t.Fatalf("重新领取邮箱失败：%d %s", newClaim.Code, newClaim.Body.String())
+	}
+
+	deactivate := leaseTestRequest(t, server, http.MethodPost, "/api/v1/mailbox-leases/"+url.PathEscape(oldLeaseID)+"/deactivate", `{
+		"project":"gpt-register-next",
+		"note":"旧账号已删除"
+	}`)
+	if deactivate.Code != http.StatusOK {
+		t.Fatalf("历史租约停用邮箱失败：%d %s", deactivate.Code, deactivate.Body.String())
+	}
+	data := payloadData(t, decodeLeaseTestPayload(t, deactivate))
+	if payloadObject(t, data, "mailbox")["status"] != domain.StatusDisabled {
+		t.Fatalf("历史租约停用接口没有返回 disabled：%+v", data)
+	}
+	stored, ok := state.FindMailboxByEmail("lease-api-fixture@icloud.com")
+	if !ok || stored.Status != domain.StatusDisabled || stored.ActiveLeaseID != "" || stored.Note != "旧账号已删除" {
+		t.Fatalf("历史租约没有将邮箱标记为已停用：%+v，存在=%t", stored, ok)
+	}
+}
+
 func TestPublicMailboxLeaseEmailCompatibilityAndNote(t *testing.T) {
 	server, state := newMailboxLeaseTestServer(t)
 	claim := leaseTestRequest(t, server, http.MethodPost, "/api/v1/mailboxes/claim", `{"project":"fixture","purpose":"兼容接口","request_id":"compat-1"}`)

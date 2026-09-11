@@ -60,6 +60,10 @@ func (s *Server) handlePublicMailboxLeaseNote(w http.ResponseWriter, r *http.Req
 	s.handlePublicMailboxLeaseAction(w, r, "note", r.PathValue("lease_id"))
 }
 
+func (s *Server) handlePublicMailboxLeaseDeactivate(w http.ResponseWriter, r *http.Request) {
+	s.handlePublicMailboxLeaseAction(w, r, "deactivate", r.PathValue("lease_id"))
+}
+
 func (s *Server) handlePublicMailboxLeaseCommitCompat(w http.ResponseWriter, r *http.Request) {
 	s.handlePublicMailboxLeaseActionCompat(w, r, "commit")
 }
@@ -70,6 +74,10 @@ func (s *Server) handlePublicMailboxLeaseReleaseCompat(w http.ResponseWriter, r 
 
 func (s *Server) handlePublicMailboxLeaseRenewCompat(w http.ResponseWriter, r *http.Request) {
 	s.handlePublicMailboxLeaseActionCompat(w, r, "renew")
+}
+
+func (s *Server) handlePublicMailboxLeaseDeactivateCompat(w http.ResponseWriter, r *http.Request) {
+	s.handlePublicMailboxLeaseActionCompat(w, r, "deactivate")
 }
 
 func (s *Server) handlePublicMailboxLeaseActionCompat(w http.ResponseWriter, r *http.Request, action string) {
@@ -135,6 +143,8 @@ func (s *Server) applyPublicMailboxLeaseAction(w http.ResponseWriter, r *http.Re
 		mailbox, lease, err = s.store.RenewMailboxLease(leaseID, project, note, s.mailboxLeaseTTL(request.TTLSeconds), now)
 	case "note":
 		mailbox, lease, err = s.store.SetMailboxLeaseNote(leaseID, project, request.Note, now)
+	case "deactivate":
+		mailbox, lease, idempotent, err = s.store.DeactivateMailboxLease(leaseID, project, note, now)
 	default:
 		writeError(w, http.StatusBadRequest, "invalid_lease_action", "邮箱租约动作不正确")
 		return

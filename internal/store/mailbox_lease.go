@@ -429,6 +429,49 @@ func (s *Store) SetMailboxLeaseNote(leaseID, project, note string, now time.Time
 	return mailbox, lease, err
 }
 
+// DeactivateMailboxLease 将租约对应的邮箱停用，并同步更新备注。
+// 账号删除以邮箱最终状态为准，即使绑定记录来自历史租约，也要将 used 更新为 disabled。
+func (s *Store) DeactivateMailboxLease(leaseID, project, note string, now time.Time) (domain.Mailbox, domain.MailboxLease, bool, error) {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return domain.Mailbox{}, domain.MailboxLease{}, false, err
+	}
+	lease, err := s.authorizedLeaseTx(tx, leaseID, project)
+	if err != nil {
+		_ = tx.Rollback()
+		return domain.Mailbox{}, domain.MailboxLease{}, false, err
+	}
+	var mailbox domain.Mailbox
+	found, _ := s.readEntityTx(tx, "mailboxes", lease.MailboxID, &mailbox)
+	if !found {
+		_ = tx.Rollback()
+		return domain.Mailbox{}, lease, false, ErrLeaseBindingConflict
+	}
+	note = strings.TrimSpace(note)
+	wasDisabled := mailbox.Status == domain.StatusDisabled && mailbox.ActiveLeaseID == ""
+	if lease.State == domain.MailboxLeaseClaimed && mailbox.ActiveLeaseID == lease.ID {
+		lease.State, lease.ReleasedAt = domain.MailboxLeaseReleased, now
+	}
+	lease.UpdatedAt = now
+	mailbox.Status, mailbox.ActiveLeaseID, mailbox.UpdatedAt = domain.StatusDisabled, "", now
+	if note != "" {
+		lease.Note, mailbox.Note = note, note
+	}
+	return s.finishLeaseMutation(
+		tx,
+		mailbox,
+		lease,
+		"warning",
+		fmt.Sprintf("项目 %s 已停用邮箱租约 %s，邮箱 %s 标记为已停用", lease.Project, lease.ID, mailbox.Email),
+		wasDisabled,
+	)
+}
+
 func (s *Store) finishLeaseMutation(tx *sql.Tx, mailbox domain.Mailbox, lease domain.MailboxLease, level, message string, idempotent bool) (domain.Mailbox, domain.MailboxLease, bool, error) {
 	leaseChange, _, err := s.upsertEntityTx(tx, "mailbox_leases", "mailbox-lease", lease.ID, lease)
 	if err != nil {
