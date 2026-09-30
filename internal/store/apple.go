@@ -32,6 +32,29 @@ func (s *Store) FindAppleAccount(id string) (domain.AppleAccount, bool) {
 	return account, found && err == nil
 }
 
+// ResolveAppleAccountID 按内部账号 ID 或 Apple ID 邮箱解析内部账号 ID。
+func (s *Store) ResolveAppleAccountID(value string) (string, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", false
+	}
+	if account, found := s.FindAppleAccount(value); found {
+		return account.ID, true
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var data []byte
+	err := s.db.QueryRow(`SELECT data_json FROM apple_accounts WHERE lower(json_extract(data_json, '$.apple_id')) = ? LIMIT 1`, strings.ToLower(value)).Scan(&data)
+	if err != nil {
+		return "", false
+	}
+	var account domain.AppleAccount
+	if s.decodeEntity("apple_accounts", data, &account) != nil || strings.TrimSpace(account.ID) == "" {
+		return "", false
+	}
+	return account.ID, true
+}
+
 func (s *Store) ICloudSessionByAccountID(accountID string) (domain.ICloudSession, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -55,6 +78,51 @@ func (s *Store) SaveICloudSessionWithEvent(session domain.ICloudSession, level, 
 		message = "已更新 Apple 登录态"
 	}
 	return s.saveICloudSession(session, "", level, message, message)
+}
+
+// SetAppleAccountEnabled 更新账号的使用状态，保留登录态和已关联邮箱。
+func (s *Store) SetAppleAccountEnabled(accountID string, enabled bool) (domain.AppleAccount, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return domain.AppleAccount{}, err
+	}
+	var account domain.AppleAccount
+	found, err := s.readEntityTx(tx, "apple_accounts", strings.TrimSpace(accountID), &account)
+	if err != nil || !found {
+		_ = tx.Rollback()
+		if err != nil {
+			return domain.AppleAccount{}, err
+		}
+		return domain.AppleAccount{}, errors.New("Apple 账号不存在")
+	}
+	status := domain.StatusDisabled
+	message := "已停用 Apple 账号："
+	if enabled {
+		status = domain.StatusActive
+		message = "已开启 Apple 账号："
+	}
+	if account.Status == status {
+		_ = tx.Rollback()
+		return account, nil
+	}
+	account.Status = status
+	account.UpdatedAt = time.Now()
+	change, _, err := s.upsertEntityTx(tx, "apple_accounts", "apple-account", account.ID, account)
+	if err != nil {
+		_ = tx.Rollback()
+		return domain.AppleAccount{}, err
+	}
+	event, err := s.appendEventTx(tx, "info", "apple", message+firstNonEmpty(account.AppleID, account.ID))
+	if err != nil {
+		_ = tx.Rollback()
+		return domain.AppleAccount{}, err
+	}
+	if err := s.commitTx(tx, []Change{change, event}); err != nil {
+		return domain.AppleAccount{}, err
+	}
+	return account, nil
 }
 
 func (s *Store) saveICloudSession(session domain.ICloudSession, password, level, updateMessage, createMessage string) (domain.ICloudSession, error) {
@@ -125,7 +193,9 @@ func (s *Store) saveICloudSession(session domain.ICloudSession, password, level,
 	if account.Label == "" {
 		account.Label = firstNonEmpty(account.AppleID, "Apple 账号")
 	}
-	account.Status = domain.StatusActive
+	if account.Status != domain.StatusDisabled {
+		account.Status = domain.StatusActive
+	}
 	account.ICloudStatus = iCloudStatusFromSession(session)
 	account.Note = firstNonEmpty(session.Note, account.Note)
 	account.UpdatedAt = time.Now()

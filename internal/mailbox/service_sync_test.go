@@ -202,6 +202,30 @@ func TestSyncMailboxBatchUsesIMAPFirst(t *testing.T) {
 	}
 }
 
+func TestSyncMailboxBatchDisablesIMAPAndUsesWeb(t *testing.T) {
+	state := openSyncTestStore(t)
+	mailbox := saveSyncTestAccount(t, state, "disabled-imap@icloud.com", true)
+	backend := &fakeMessageSyncBackend{
+		webResult: protocol.MailSyncBatchResult{MessagesByMailbox: map[string][]protocol.ICloudSyncedMessage{}, Scanned: 2},
+	}
+	service := NewService(config.Default(), state)
+	service.messageBackend = backend
+
+	result, err := service.SyncMailboxBatchWithOptions(context.Background(), []domain.Mailbox{mailbox}, MessageSyncOptions{
+		Mode: protocol.MailSyncModeVerification, Limit: 20, UseCursor: true,
+		AllowWebAPI: true, AllowFallback: true, DisableIMAP: true,
+	})
+	if err != nil || result.IMAPAccounts != 0 || result.WebAPIAccounts != 1 {
+		t.Fatalf("停用 IMAP 后应使用 Web API：结果=%+v，错误=%v", result, err)
+	}
+	if len(result.Accounts) != 1 || result.Accounts[0].Method != "web_api" {
+		t.Fatalf("停用 IMAP 后同步方式不正确：%+v", result.Accounts)
+	}
+	if imap, web, _ := backend.counts(); imap != 0 || web != 1 {
+		t.Fatalf("停用 IMAP 后不应调用 IMAP：IMAP=%d，Web=%d", imap, web)
+	}
+}
+
 func TestCodeSyncDoesNotUseWebAPIByDefault(t *testing.T) {
 	state := openSyncTestStore(t)
 	mailbox := saveSyncTestAccount(t, state, "code-default@icloud.com", false)
@@ -463,8 +487,11 @@ func TestManualMailboxSyncReportsWebComplementFailure(t *testing.T) {
 	service.messageBackend = backend
 
 	result, err := service.SyncMailboxMessages(context.Background(), mailbox.ID)
-	if err == nil || !strings.Contains(err.Error(), "Web 补查测试故障") || result.IMAPAccounts != 1 || result.WebAPIAccounts != 0 {
-		t.Fatalf("手动同步应报告 Web 补查失败并保留 IMAP 结果：结果=%+v，错误=%v", result, err)
+	if err != nil || result.IMAPAccounts != 1 || result.WebAPIAccounts != 0 {
+		t.Fatalf("手动同步应保留 IMAP 成功结果：结果=%+v，错误=%v", result, err)
+	}
+	if !strings.Contains(result.Accounts[0].FallbackReason, "Web 补查测试故障") {
+		t.Fatalf("Web 补查路径提示缺失：%+v", result.Accounts)
 	}
 	var cursor MailSyncState
 	if found, loadErr := state.LoadRuntimeState(mailSyncStateID(mailbox.AccountID, "imap", "source"), &cursor); loadErr != nil || !found {

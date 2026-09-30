@@ -109,6 +109,7 @@ type MessageSyncOptions struct {
 	AllowWebAPI      bool
 	AllowFallback    bool
 	UseWebComplement bool
+	DisableIMAP      bool
 	Reconcile        bool
 }
 
@@ -363,6 +364,11 @@ func (s *Service) ImportLocal(accountID, email, label, note string) (domain.Mail
 }
 
 func (s *Service) Create(ctx context.Context, accountID, label, note, channel string) (domain.Mailbox, error) {
+	if account, found := s.store.FindAppleAccount(accountID); !found {
+		return domain.Mailbox{}, errors.New("Apple 账号不存在")
+	} else if account.Status == domain.StatusDisabled {
+		return domain.Mailbox{}, errors.New("Apple 账号已停用")
+	}
 	session, ok := s.store.ICloudSessionByAccountID(accountID)
 	if !ok {
 		return domain.Mailbox{}, errors.New("Apple 账号登录态不存在")
@@ -398,6 +404,11 @@ func (s *Service) Create(ctx context.Context, accountID, label, note, channel st
 }
 
 func (s *Service) SyncRemote(ctx context.Context, accountID string) ([]domain.Mailbox, error) {
+	if account, found := s.store.FindAppleAccount(accountID); !found {
+		return nil, errors.New("Apple 账号不存在")
+	} else if account.Status == domain.StatusDisabled {
+		return nil, errors.New("Apple 账号已停用")
+	}
 	session, ok := s.store.ICloudSessionByAccountID(accountID)
 	if !ok {
 		return nil, errors.New("Apple 账号登录态不存在")
@@ -1797,6 +1808,11 @@ func (s *Service) syncGroupNow(ctx context.Context, mailboxes []domain.Mailbox, 
 		}
 		refreshed = shared
 	}
+	if !customIMAP {
+		if account, found := s.store.FindAppleAccount(accountID); found && account.Status == domain.StatusDisabled {
+			return AccountMessageSyncResult{AccountID: accountID, Account: firstNonEmpty(account.AppleID, account.ID), Mailboxes: len(refreshed)}, errors.New("Apple 账号已停用")
+		}
+	}
 	if account, found := s.store.FindAppleAccount(accountID); found {
 		accountName = firstNonEmpty(account.Label, account.AppleID, accountID)
 	}
@@ -1813,7 +1829,6 @@ func (s *Service) syncGroupNow(ctx context.Context, mailboxes []domain.Mailbox, 
 	var syncResult protocol.MailSyncBatchResult
 	var syncErr error
 	var imapErr error
-	var complementErr error
 	source := "icloud"
 	imapState, imapSaved := protocol.LoginStateForKind(session, domain.LoginStateICloudIMAP)
 	if customIMAP {
@@ -1826,6 +1841,9 @@ func (s *Service) syncGroupNow(ctx context.Context, mailboxes []domain.Mailbox, 
 	}
 	protocolOptions.DiscoveryDomains = s.discoveryDomainsForSync(refreshed, customRoute)
 	imapConfigured := imapSaved && strings.TrimSpace(imapState.IMAPEmail) != "" && strings.TrimSpace(imapState.IMAPAppPassword) != ""
+	if options.DisableIMAP {
+		imapConfigured = false
+	}
 	sourceSignature := imapSourceSignature(imapState)
 	cursorStateID := mailSyncStateID(accountID, "imap", "source")
 	cursorFound := false
@@ -1900,10 +1918,7 @@ func (s *Service) syncGroupNow(ctx context.Context, mailboxes []domain.Mailbox, 
 				source = ""
 			} else {
 				accountResult.FallbackReason = "IMAP 已完成，但 iCloud Web 补查失败：" + webErr.Error()
-				// 单行手动同步需要明确告知用户补查失败，批量和后台同步保留 IMAP 成功结果。
-				if options.Trigger == "manual" {
-					complementErr = errors.New(accountResult.FallbackReason)
-				}
+				// IMAP 已经完成时，Web 补查失败只作为提示保留；不能把邮箱池同步判定为失败。
 			}
 		}
 	}
@@ -2051,7 +2066,7 @@ func (s *Service) syncGroupNow(ctx context.Context, mailboxes []domain.Mailbox, 
 	accountResult.SyncedMessages = created
 	accountResult.HasMore = syncResult.HasMore
 	accountResult.InitializedCursor = syncResult.InitializedCursor
-	return accountResult, complementErr
+	return accountResult, nil
 }
 
 func mergeMailSyncBatchResults(primary, complement protocol.MailSyncBatchResult) protocol.MailSyncBatchResult {
@@ -2272,7 +2287,7 @@ func messageSyncRequestSignature(mailboxes []domain.Mailbox, options MessageSync
 	parts := []string{
 		string(options.Mode), options.Trigger, options.After.UTC().Format(time.RFC3339Nano), fmt.Sprint(options.Limit),
 		fmt.Sprint(options.FullScan), fmt.Sprint(options.FullScanOnFirst), fmt.Sprint(options.UseCursor),
-		fmt.Sprint(options.AllowWebAPI), fmt.Sprint(options.AllowFallback), fmt.Sprint(options.UseWebComplement), fmt.Sprint(options.Reconcile),
+		fmt.Sprint(options.AllowWebAPI), fmt.Sprint(options.AllowFallback), fmt.Sprint(options.UseWebComplement), fmt.Sprint(options.DisableIMAP), fmt.Sprint(options.Reconcile),
 	}
 	ids := make([]string, 0, len(mailboxes))
 	for _, mailbox := range mailboxes {

@@ -360,7 +360,7 @@ func (s *Store) Dashboard() domain.Dashboard {
 	defer s.mu.RUnlock()
 	out := domain.Dashboard{}
 	_ = s.db.QueryRow(`SELECT COUNT(*) FROM apple_accounts`).Scan(&out.AppleAccountCount)
-	_ = s.db.QueryRow(`SELECT COUNT(*) FROM apple_accounts WHERE lower(json_extract(data_json, '$.status')) = 'active' OR lower(json_extract(data_json, '$.icloud_status')) = 'active'`).Scan(&out.ActiveAccountCount)
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM apple_accounts WHERE lower(json_extract(data_json, '$.status')) <> 'disabled' AND (lower(json_extract(data_json, '$.status')) = 'active' OR lower(json_extract(data_json, '$.icloud_status')) = 'active')`).Scan(&out.ActiveAccountCount)
 	_ = s.db.QueryRow(`SELECT COUNT(*) FROM mailboxes`).Scan(&out.MailboxCount)
 	_ = s.db.QueryRow(`SELECT COUNT(*) FROM mailboxes WHERE json_extract(data_json, '$.api_active') = 1 AND json_extract(data_json, '$.icloud_active') = 1 AND lower(json_extract(data_json, '$.status')) = 'available'`).Scan(&out.AvailableCount)
 	_ = s.db.QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&out.MessageCount)

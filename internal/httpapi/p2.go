@@ -38,19 +38,21 @@ func (s *Server) handlePublicHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"success": true,
 		"data": map[string]any{
-			"service":                    "icloud-privacy-mail-v2",
-			"version":                    current.Version,
-			"commit":                     current.Commit,
-			"api_active":                 s.store.Settings().EnablePublicMailboxAPI && s.globalAPIKey() != "",
-			"icloud_active":              active,
-			"lease_api_version":          1,
-			"lease_ttl_seconds":          s.cfg.PublicMailboxLeaseTTLMinutes * 60,
-			"lease_max_ttl_seconds":      s.cfg.PublicMailboxLeaseMaxTTLMinutes * 60,
-			"mailbox_note_api_supported": true,
-			"mailbox_kind_filters":       []string{"any", domain.MailboxKindICloudHME, domain.MailboxKindDomainForward},
-			"domain_filter_supported":    true,
-			"message_api_supported":      true,
-			"time":                       time.Now().Format(time.RFC3339),
+			"service":                     "icloud-privacy-mail-v2",
+			"version":                     current.Version,
+			"commit":                      current.Commit,
+			"api_active":                  s.store.Settings().EnablePublicMailboxAPI && s.globalAPIKey() != "",
+			"icloud_active":               active,
+			"lease_api_version":           1,
+			"lease_ttl_seconds":           s.cfg.PublicMailboxLeaseTTLMinutes * 60,
+			"lease_max_ttl_seconds":       s.cfg.PublicMailboxLeaseMaxTTLMinutes * 60,
+			"mailbox_note_api_supported":  true,
+			"mailbox_kind_filters":        []string{"any", domain.MailboxKindICloudHME, domain.MailboxKindDomainForward},
+			"account_id_filter_supported": true,
+			"apple_id_filter_supported":   true,
+			"domain_filter_supported":     true,
+			"message_api_supported":       true,
+			"time":                        time.Now().Format(time.RFC3339),
 		},
 	})
 }
@@ -72,6 +74,8 @@ func (s *Server) handlePublicClaimMailbox(w http.ResponseWriter, r *http.Request
 		TTLSeconds  int    `json:"ttl_seconds"`
 		MailboxKind string `json:"mailbox_kind"`
 		Domain      string `json:"domain"`
+		AccountID   string `json:"account_id"`
+		AppleID     string `json:"apple_id"`
 	}
 	if r.ContentLength != 0 {
 		if err := decodeJSON(r, &body); err != nil {
@@ -80,6 +84,8 @@ func (s *Server) handlePublicClaimMailbox(w http.ResponseWriter, r *http.Request
 		}
 	}
 	body.MailboxKind = strings.ToLower(strings.TrimSpace(body.MailboxKind))
+	body.AccountID = strings.TrimSpace(body.AccountID)
+	body.AppleID = strings.TrimSpace(body.AppleID)
 	if body.MailboxKind == "any" {
 		body.MailboxKind = ""
 	}
@@ -91,6 +97,19 @@ func (s *Server) handlePublicClaimMailbox(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, "invalid_mailbox_domain", "domain 仅用于领取 domain_forward 域名邮箱")
 		return
 	}
+	if body.AppleID != "" {
+		body.AccountID = body.AppleID
+	}
+	if body.AccountID != "" {
+		resolvedAccountID, found := s.store.ResolveAppleAccountID(body.AccountID)
+		if strings.Contains(body.AccountID, "@") && !found {
+			writeError(w, http.StatusBadRequest, "apple_account_not_found", "Apple 账号不存在")
+			return
+		}
+		if found {
+			body.AccountID = resolvedAccountID
+		}
+	}
 	mailbox, lease, created, err := s.store.ClaimMailboxLeaseFiltered(
 		body.Project,
 		body.Purpose,
@@ -98,7 +117,7 @@ func (s *Server) handlePublicClaimMailbox(w http.ResponseWriter, r *http.Request
 		body.Note,
 		s.mailboxLeaseTTL(body.TTLSeconds),
 		time.Now(),
-		store.MailboxClaimFilter{MailboxKind: body.MailboxKind, Domain: body.Domain},
+		store.MailboxClaimFilter{MailboxKind: body.MailboxKind, Domain: body.Domain, AccountID: body.AccountID},
 	)
 	if err != nil {
 		if errors.Is(err, store.ErrNoAvailableMailbox) {

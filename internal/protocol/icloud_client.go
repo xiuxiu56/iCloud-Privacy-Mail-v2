@@ -1422,11 +1422,20 @@ func (c *ICloudClient) SyncMailboxMessagesBatchWithOptions(ctx context.Context, 
 	seenThreads := make(map[string]bool)
 	for _, folder := range folders {
 		maxThreads := mailThreadSearchLimit(folder, options)
-		threads, err := c.searchThreadsWithOptions(ctx, session, folder, maxThreads, options.FullScan)
+		var threads []mailThread
+		var folderHasMore bool
+		if options.FullScan {
+			// 邮箱池内容同步沿用网页抓包中的 thread/search；fetchCategoryView 是网页分类初始化查询，不能作为这里的补查入口。
+			threads, err = c.searchThreadsWithOptions(ctx, session, folder, maxThreads, true)
+			folderHasMore = len(threads) >= maxThreads
+		} else {
+			threads, err = c.searchThreadsWithOptions(ctx, session, folder, maxThreads, false)
+			folderHasMore = len(threads) >= maxThreads
+		}
 		if err != nil {
 			return MailSyncBatchResult{MessagesByMailbox: out, Scanned: scanned, Matched: countMatchedMessages(out)}, err
 		}
-		if len(threads) >= maxThreads {
+		if folderHasMore {
 			hasMore = true
 		}
 		for _, thread := range threads {
@@ -1506,11 +1515,11 @@ func (c *ICloudClient) FindRemoteMessageIDsByMailbox(ctx context.Context, sessio
 	seenThreads := make(map[string]bool)
 	for _, folder := range folders {
 		const maxThreads = 1000
-		threads, err := c.searchThreadsWithOptions(ctx, session, folder, maxThreads, true)
+		threads, hasMore, err := c.searchThreadsFromGEQS(ctx, session, folder, maxThreads)
 		if err != nil {
 			return result, err
 		}
-		if len(threads) >= maxThreads {
+		if hasMore {
 			return result, errCode("icloud_remote_scan_incomplete", "iCloud 云端单个文件夹返回了 1000 个邮件线程，为避免遗漏邮件，本次未继续删除", true)
 		}
 		for _, thread := range threads {
@@ -1691,6 +1700,76 @@ func (c *ICloudClient) searchThreadsWithOptions(ctx context.Context, session ICl
 	return threads, nil
 }
 
+// 全量同步使用网页端的邮件查询接口及延续标记，避免只处理首批 1000 条线程。
+func (c *ICloudClient) searchThreadsFromGEQS(ctx context.Context, session ICloudSession, folder mailFolder, limit int) ([]mailThread, bool, error) {
+	if strings.TrimSpace(folder.ID) == "" {
+		return nil, false, errCode("icloud_mail_folder_id_missing", "iCloud 邮件夹缺少 identifier，无法执行全量补查", true)
+	}
+	if limit <= 0 || limit > 1000 {
+		limit = 1000
+	}
+	var threads []mailThread
+	marker := ""
+	seenMarkers := make(map[string]bool)
+	for page := 0; page < 100; page++ {
+		var out struct {
+			DomainObjects []struct {
+				Identifier          string          `json:"identifier"`
+				AppleThrid          string          `json:"appleThrid"`
+				ThreadID            string          `json:"threadId"`
+				EmailMatchTimestamp json.RawMessage `json:"emailMatchTimestamp"`
+			} `json:"domainObjects"`
+			ContinuationMarker string `json:"continuationMarker"`
+		}
+		body := mailGEQSFullScanBody(folder.ID, limit, marker)
+		if err := c.callMail(ctx, session, "/mailws2/v1/geqs/query", body, "fetchCategoryView", &out); err != nil {
+			return threads, true, err
+		}
+		for _, item := range out.DomainObjects {
+			threadID := firstNonEmpty(item.AppleThrid, item.ThreadID, item.Identifier)
+			if threadID = strings.TrimSpace(threadID); threadID != "" {
+				threads = append(threads, mailThread{ThreadID: threadID, ReceivedAt: parseMailTime(item.EmailMatchTimestamp)})
+			}
+		}
+		next := strings.TrimSpace(out.ContinuationMarker)
+		if next == "" {
+			// GEQS 用 continuationMarker 明确表示是否还有下一页；最后一页恰好填满 limit 时也不再猜测。
+			return threads, false, nil
+		}
+		if seenMarkers[next] {
+			return threads, true, errCode("icloud_mail_pagination_loop", "iCloud 邮件查询重复返回相同分页标记", true)
+		}
+		seenMarkers[next] = true
+		marker = next
+	}
+	return threads, true, errCode("icloud_mail_page_limit", "iCloud 邮件查询超过 100 页，请缩小同步范围后重试", true)
+}
+
+func mailGEQSFullScanBody(folderID string, limit int, marker string) map[string]any {
+	body := map[string]any{
+		"domain":     "email",
+		"properties": []string{"identifier", "emailMatchTimestamp"},
+		"limit":      limit,
+		"predicate": map[string]any{
+			"type":       "eq",
+			"expression": map[string]any{"type": "fieldOf", "property": "flags", "value": "DELETED"},
+			"value":      false,
+			"and": []any{map[string]any{
+				"type":       "mapHasKeyIn",
+				"expression": map[string]any{"property": "mboxRefUidMap"},
+				"value":      []string{folderID},
+			}},
+		},
+		"collapseOn":  "appleThrid",
+		"orderby":     map[string]any{"expressions": []any{map[string]any{"property": "stateInternalDate", "type": "property"}}, "ascending": false},
+		"strictLimit": false,
+	}
+	if marker != "" {
+		body["continuationMarker"] = marker
+	}
+	return body
+}
+
 func mailThreadSearchBody(folder mailFolder, maxThreads int, fullScan bool) map[string]any {
 	responseType := "THREAD_DIGEST"
 	includeFolderStatus := false
@@ -1723,11 +1802,12 @@ func (c *ICloudClient) threadMessagesForAliases(ctx context.Context, session ICl
 func (c *ICloudClient) threadRemoteMessageIDsByMailbox(ctx context.Context, session ICloudSession, folder mailFolder, threadID string, aliases map[string]string) (map[string][]string, error) {
 	var out struct {
 		MessageMetadataList []struct {
-			UID    json.RawMessage `json:"uid"`
-			Folder string          `json:"folder"`
-			To     json.RawMessage `json:"to"`
-			CC     json.RawMessage `json:"cc"`
-			BCC    json.RawMessage `json:"bcc"`
+			UID        json.RawMessage `json:"uid"`
+			Folder     string          `json:"folder"`
+			To         json.RawMessage `json:"to"`
+			CC         json.RawMessage `json:"cc"`
+			BCC        json.RawMessage `json:"bcc"`
+			LongHeader string          `json:"longHeader"`
 		} `json:"messageMetadataList"`
 	}
 	body := map[string]any{
@@ -1745,7 +1825,7 @@ func (c *ICloudClient) threadRemoteMessageIDsByMailbox(ctx context.Context, sess
 		}
 		folderName := firstNonEmpty(cleanMailFolder(meta.Folder), folder.Name)
 		remoteID := "icloud:" + folderName + ":" + uid
-		recipients := string(meta.To) + "\n" + string(meta.CC) + "\n" + string(meta.BCC)
+		recipients := webMessageRecipientText(string(meta.To), string(meta.CC), string(meta.BCC), mailHeaderRecipients(meta.LongHeader))
 		for _, mailboxID := range matchingMailboxIDs(recipients, aliases) {
 			matches[mailboxID] = append(matches[mailboxID], remoteID)
 		}
@@ -1756,17 +1836,18 @@ func (c *ICloudClient) threadRemoteMessageIDsByMailbox(ctx context.Context, sess
 func (c *ICloudClient) threadMessagesForAliasesWithDiscovery(ctx context.Context, session ICloudSession, folder mailFolder, threadID string, aliases map[string]string, afterByMailbox map[string]time.Time, discoveryDomains []string) (map[string][]ICloudSyncedMessage, map[string][]ICloudSyncedMessage, error) {
 	var out struct {
 		MessageMetadataList []struct {
-			UID       json.RawMessage `json:"uid"`
-			Folder    string          `json:"folder"`
-			MessageID string          `json:"messageId"`
-			Subject   string          `json:"subject"`
-			Preview   string          `json:"preview"`
-			Date      json.RawMessage `json:"date"`
-			From      json.RawMessage `json:"from"`
-			To        json.RawMessage `json:"to"`
-			CC        json.RawMessage `json:"cc"`
-			BCC       json.RawMessage `json:"bcc"`
-			Parts     []struct {
+			UID        json.RawMessage `json:"uid"`
+			Folder     string          `json:"folder"`
+			MessageID  string          `json:"messageId"`
+			Subject    string          `json:"subject"`
+			Preview    string          `json:"preview"`
+			Date       json.RawMessage `json:"date"`
+			From       json.RawMessage `json:"from"`
+			To         json.RawMessage `json:"to"`
+			CC         json.RawMessage `json:"cc"`
+			BCC        json.RawMessage `json:"bcc"`
+			LongHeader string          `json:"longHeader"`
+			Parts      []struct {
 				PartID      string `json:"partId"`
 				ContentType string `json:"contentType"`
 				IsAttach    bool   `json:"isAttach"`
@@ -1792,10 +1873,10 @@ func (c *ICloudClient) threadMessagesForAliasesWithDiscovery(ctx context.Context
 		receivedAt := firstNonZeroTime(parseMailTime(meta.Date), time.Now())
 		folderName := firstNonEmpty(cleanMailFolder(meta.Folder), folder.Name)
 		from := addressSummary(meta.From)
-		recipients := string(meta.To) + "\n" + string(meta.CC) + "\n" + string(meta.BCC)
+		recipients := webMessageRecipientText(string(meta.To), string(meta.CC), string(meta.BCC), mailHeaderRecipients(meta.LongHeader))
 		matchedMailboxIDs := matchingMailboxIDs(recipients, aliases)
 		discoveredEmails := matchingDiscoveredEmails(recipients, discoveryDomains, aliases)
-		if len(matchedMailboxIDs) == 0 && len(discoveredEmails) == 0 {
+		if len(matchedMailboxIDs) == 0 && len(discoveredEmails) == 0 && len(discoveryDomains) == 0 && strings.TrimSpace(meta.LongHeader) == "" {
 			continue
 		}
 		bodyText := meta.Preview
@@ -1808,10 +1889,18 @@ func (c *ICloudClient) threadMessagesForAliasesWithDiscovery(ctx context.Context
 				return messages, discovered, err
 			}
 			longHeader = detail.LongHeader
+			if headerRecipients := mailHeaderRecipients(longHeader); headerRecipients != "" {
+				recipients = webMessageRecipientText(recipients, headerRecipients)
+				matchedMailboxIDs = matchingMailboxIDs(recipients, aliases)
+				discoveredEmails = matchingDiscoveredEmails(recipients, discoveryDomains, aliases)
+			}
 			if strings.TrimSpace(detail.TextBody) != "" {
 				bodyText = detail.TextBody
 			}
 			htmlBody = detail.HTMLBody
+		}
+		if len(matchedMailboxIDs) == 0 && len(discoveredEmails) == 0 {
+			continue
 		}
 		if strings.TrimSpace(bodyText) == "" && strings.TrimSpace(htmlBody) != "" {
 			bodyText = normalizeMailBody(htmlBody)
@@ -1832,6 +1921,7 @@ func (c *ICloudClient) threadMessagesForAliasesWithDiscovery(ctx context.Context
 			HTMLBody:    strings.TrimSpace(htmlBody),
 			ContentType: contentType,
 			ReceivedAt:  receivedAt,
+			Recipients:  extractRecipientEmails(recipients),
 		}
 		for _, mailboxID := range matchedMailboxIDs {
 			after := afterByMailbox[mailboxID]
@@ -1858,6 +1948,24 @@ func mailHeaderValue(rawHeader, name string) string {
 		return ""
 	}
 	return strings.TrimSpace(message.Header.Get(name))
+}
+
+// webMessageRecipientText 合并线程元数据和原始邮件头中的收件人。
+// X-Original-To、Delivered-To 等字段用于识别转发到域名邮箱的原始地址。
+func webMessageRecipientText(values ...string) string {
+	return strings.Join(values, "\n")
+}
+
+func mailHeaderRecipients(rawHeader string) string {
+	rawHeader = strings.TrimSpace(rawHeader)
+	if rawHeader == "" {
+		return ""
+	}
+	message, err := mail.ReadMessage(strings.NewReader(rawHeader + "\r\n\r\n"))
+	if err != nil {
+		return ""
+	}
+	return imapRecipientHeaderText(message.Header)
 }
 
 func matchingMailboxIDs(recipients string, aliases map[string]string) []string {
@@ -2667,8 +2775,15 @@ func (c *ICloudClient) endpointWithBase(session ICloudSession, baseURL, path str
 	rel := &url.URL{Path: strings.TrimLeft(path, "/")}
 	u := base.ResolveReference(rel)
 	q := u.Query()
-	q.Set("clientBuildNumber", firstNonEmpty(session.ClientBuildNumber, "2622Build20"))
-	q.Set("clientMasteringNumber", firstNonEmpty(session.MasteringNumber, session.ClientBuildNumber, "2622Build20"))
+	buildNumber := firstNonEmpty(session.ClientBuildNumber, iCloudPortalBuildNumber)
+	masteringNumber := firstNonEmpty(session.MasteringNumber, buildNumber)
+	// 邮件网关跟随邮件前端的 Hotfix 构建号；登录校验仍使用门户 Build。
+	if isAppleMailGateway(baseURL) {
+		buildNumber = iCloudMailBuildNumber
+		masteringNumber = iCloudMailBuildNumber
+	}
+	q.Set("clientBuildNumber", buildNumber)
+	q.Set("clientMasteringNumber", masteringNumber)
 	q.Set("clientId", firstNonEmpty(session.ClientID, "local-panel"))
 	q.Set("dsid", session.DSID)
 	u.RawQuery = q.Encode()
@@ -3042,6 +3157,8 @@ func setICloudFetchHeaders(req *http.Request, session ICloudSession, accept, con
 		accept = "*/*"
 	}
 	req.Header.Set("Accept", accept)
+	req.Header.Set("Cache-Control", "no-cache")
+	req.Header.Set("Pragma", "no-cache")
 	if strings.TrimSpace(contentType) != "" {
 		req.Header.Set("Content-Type", contentType)
 	}
@@ -3051,11 +3168,11 @@ func setICloudFetchHeaders(req *http.Request, session ICloudSession, accept, con
 	req.Header.Set("Sec-Fetch-Site", "same-site")
 	req.Header.Set("Sec-Fetch-Mode", "cors")
 	req.Header.Set("Sec-Fetch-Dest", "empty")
-	req.Header.Set("Sec-CH-UA-Platform", `"Windows"`)
-	req.Header.Set("Sec-CH-UA", `"Google Chrome";v="143", "Chromium";v="143", "Not A(Brand";v="24"`)
+	req.Header.Set("Sec-CH-UA-Platform", `"macOS"`)
+	req.Header.Set("Sec-CH-UA", `"Google Chrome";v="153", "Not_A Brand";v="8", "Chromium";v="153"`)
 	req.Header.Set("Sec-CH-UA-Mobile", "?0")
 	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36")
+	req.Header.Set("User-Agent", iCloudWebUserAgent)
 }
 
 func iCloudOrigin(session ICloudSession) string {

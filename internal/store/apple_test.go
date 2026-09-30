@@ -2,6 +2,7 @@ package store
 
 import (
 	"bytes"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -48,6 +49,69 @@ func TestSaveICloudSessionWithPasswordEncryptsAndReturnsOnlyInDetail(t *testing.
 	detail, ok = reopened.FindAppleAccount(session.AccountID)
 	if !ok || detail.Password != password {
 		t.Fatalf("重启后 Apple ID 密码解密结果不正确：%+v", detail)
+	}
+}
+
+func TestSetAppleAccountEnabledPersistsStatus(t *testing.T) {
+	state, err := Open(filepath.Join(t.TempDir(), "app.db"))
+	if err != nil {
+		t.Fatalf("创建临时数据库失败：%v", err)
+	}
+	defer state.Close()
+	session, err := state.SaveICloudSession(domain.ICloudSession{AppleID: "toggle@icloud.com"})
+	if err != nil {
+		t.Fatalf("保存测试账号失败：%v", err)
+	}
+	account, err := state.SetAppleAccountEnabled(session.AccountID, false)
+	if err != nil || account.Status != domain.StatusDisabled {
+		t.Fatalf("停用账号失败：账号=%+v 错误=%v", account, err)
+	}
+	account, err = state.SetAppleAccountEnabled(session.AccountID, true)
+	if err != nil || account.Status != domain.StatusActive {
+		t.Fatalf("开启账号失败：账号=%+v 错误=%v", account, err)
+	}
+	loaded, found := state.FindAppleAccount(session.AccountID)
+	if !found || loaded.Status != domain.StatusActive {
+		t.Fatalf("账号状态没有持久化：找到=%t 账号=%+v", found, loaded)
+	}
+	if _, err := state.SetAppleAccountEnabled(session.AccountID, false); err != nil {
+		t.Fatalf("再次停用账号失败：%v", err)
+	}
+	if _, err := state.SaveICloudSession(domain.ICloudSession{AccountID: session.AccountID, AppleID: session.AppleID}); err != nil {
+		t.Fatalf("更新停用账号登录态失败：%v", err)
+	}
+	loaded, found = state.FindAppleAccount(session.AccountID)
+	if !found || loaded.Status != domain.StatusDisabled {
+		t.Fatalf("更新登录态时不应自动开启停用账号：找到=%t 账号=%+v", found, loaded)
+	}
+}
+
+func TestDisabledAppleAccountIsSkippedWhenClaimingMailbox(t *testing.T) {
+	state, err := Open(filepath.Join(t.TempDir(), "app.db"))
+	if err != nil {
+		t.Fatalf("创建临时数据库失败：%v", err)
+	}
+	defer state.Close()
+	session, err := state.SaveICloudSession(domain.ICloudSession{AppleID: "claim-toggle@icloud.com"})
+	if err != nil {
+		t.Fatalf("保存测试账号失败：%v", err)
+	}
+	if _, _, err := state.UpsertMailboxFromRemote(session.AccountID, domain.RemoteMailbox{Email: "available@icloud.com", IsActive: true}, ""); err != nil {
+		t.Fatalf("创建测试邮箱失败：%v", err)
+	}
+	if _, err := state.SetAppleAccountEnabled(session.AccountID, false); err != nil {
+		t.Fatalf("停用账号失败：%v", err)
+	}
+	_, _, _, err = state.ClaimMailboxLease("claim-disabled", "测试", "", "", time.Hour, time.Now())
+	if !errors.Is(err, ErrNoAvailableMailbox) {
+		t.Fatalf("停用账号的邮箱不应被领取：%v", err)
+	}
+	if _, err := state.SetAppleAccountEnabled(session.AccountID, true); err != nil {
+		t.Fatalf("开启账号失败：%v", err)
+	}
+	mailbox, _, _, err := state.ClaimMailboxLease("claim-enabled", "测试", "", "", time.Hour, time.Now())
+	if err != nil || mailbox.Email != "available@icloud.com" {
+		t.Fatalf("重新开启后应可领取邮箱：邮箱=%+v 错误=%v", mailbox, err)
 	}
 }
 

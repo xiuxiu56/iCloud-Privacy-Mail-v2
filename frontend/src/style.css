@@ -982,7 +982,7 @@ textarea.field {
 }
 
 .apple-col-action {
-  width: 52px;
+  width: 86px;
 }
 
 .apple-account-select {
@@ -1104,6 +1104,54 @@ textarea.field {
   transition: 160ms ease;
 }
 
+.apple-row-actions {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+}
+
+.apple-toggle-button,
+.apple-state-check-button {
+  display: inline-grid;
+  place-items: center;
+  border: 1px solid #bbf7d0;
+  border-radius: 8px;
+  color: #16a34a;
+  background: #f0fdf4;
+  transition: 160ms ease;
+}
+
+.apple-toggle-button {
+  width: 28px;
+  height: 28px;
+}
+
+.apple-toggle-button:hover:not(:disabled),
+.apple-state-check-button:hover:not(:disabled) {
+  border-color: #4ade80;
+  background: #dcfce7;
+}
+
+.apple-toggle-button-disabled {
+  border-color: #cbd5e1;
+  color: #64748b;
+  background: #f8fafc;
+}
+
+.dark .apple-toggle-button,
+.dark .apple-state-check-button {
+  border-color: #14532d;
+  color: #86efac;
+  background: rgb(20 83 45 / 35%);
+}
+
+.dark .apple-toggle-button-disabled {
+  border-color: #475569;
+  color: #cbd5e1;
+  background: rgb(51 65 85 / 55%);
+}
+
 .apple-delete-button:hover:not(:disabled) {
   border-color: #fb7185;
   background: #ffe4e6;
@@ -1214,6 +1262,12 @@ textarea.field {
 .apple-state-checking {
   flex: 0 0 auto;
   padding: 4px 6px;
+}
+
+.apple-state-check-button {
+  width: 25px;
+  height: 25px;
+  flex: 0 0 25px;
 }
 
 .apple-state-checking {

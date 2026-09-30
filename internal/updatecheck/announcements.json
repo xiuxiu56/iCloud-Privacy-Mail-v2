@@ -1,13 +1,22 @@
 {
   "schema_version": 1,
   "latest": {
-    "version": "2.2.2",
-    "name": "2.2.2 源码版",
-    "notes": "Server 酱通知新增中国时间当日序号，显示“第 N 次通知”，每天 00:00 自动重置且服务重启后延续计数。请重新下载最新源代码，并按照 README 重新构建和启动。",
-    "published_at": "2026-08-30T21:40:00+08:00",
+    "version": "2.2.3",
+    "name": "2.2.3 源码版",
+    "notes": "邮箱领取筛选、公共取码页和域名原始收件人识别已更新。请从开源仓库重新下载并构建。",
+    "published_at": "2026-09-30T00:00:00+08:00",
     "url": "https://github.com/xiuxiu56/iCloud-Privacy-Mail-v2/archive/refs/heads/main.zip"
   },
   "announcements": [
+    {
+      "id": "source-version-2-2-3",
+      "type": "update",
+      "title": "2.2.3 邮箱筛选与同步链路已更新",
+      "summary": "公共取号支持 Apple 账号筛选，公共取码页只查询当前输入邮箱，域名邮箱按原始收件人识别。",
+      "content": "外部邮箱领取接口支持使用 apple_id 或 account_id 指定 Apple 账号；为空时按 created_at 从早到晚领取。公共取码页面的邮件列表、邮件详情和验证码请求都绑定当前输入邮箱。iCloud Web 同步会结合原始邮件头中的 X-Original-To、Delivered-To 等收件人字段识别域名邮箱，并继续使用 thread/search 作为邮箱池同步入口。IMAP IDLE 连续重连失败超过 3 次后会停用该账号的 IDLE。源码仓库为 https://github.com/xiuxiu56/iCloud-Privacy-Mail-v2。",
+      "published_at": "2026-09-30T00:00:00+08:00",
+      "url": "https://github.com/xiuxiu56/iCloud-Privacy-Mail-v2/archive/refs/heads/main.zip"
+    },
     {
       "id": "source-version-2-2-2",
       "type": "update",

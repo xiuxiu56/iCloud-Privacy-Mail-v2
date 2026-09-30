@@ -63,6 +63,37 @@ func TestPublicCodePageMessagesRequireEnabledSetting(t *testing.T) {
 	}
 }
 
+func TestPublicCodePageQueriesOnlyCurrentInputMailbox(t *testing.T) {
+	server, state, mailbox := newPublicCodeTestServer(t, true)
+	other, _, err := state.UpsertMailboxFromRemote(mailbox.AccountID, domain.RemoteMailbox{Email: "other-public@example.net", IsActive: true}, "")
+	if err != nil {
+		t.Fatalf("创建第二个测试邮箱失败：%v", err)
+	}
+	for _, item := range []struct {
+		mailbox domain.Mailbox
+		subject string
+	}{
+		{mailbox: mailbox, subject: "当前输入邮箱邮件"},
+		{mailbox: other, subject: "其他邮箱邮件"},
+	} {
+		created, syncErr := state.ApplyMailboxSyncBatch([]store.MailboxSyncUpdate{{MailboxID: item.mailbox.ID, Messages: []store.MailboxSyncMessage{{
+			RemoteID: "imap:" + item.subject, Source: "imap", Subject: item.subject, From: "sender@example.com", Body: item.subject, ReceivedAt: time.Now(),
+		}}}})
+		if syncErr != nil || created != 1 {
+			t.Fatalf("准备公共页面测试邮件失败：邮箱=%s created=%d err=%v", item.mailbox.Email, created, syncErr)
+		}
+	}
+	response := publicCodeTestRequest(t, server, "/api/v1/public-code/messages?email="+url.QueryEscape(mailbox.Email))
+	if response.Code != http.StatusOK {
+		t.Fatalf("当前邮箱邮件列表状态码为 %d：%s", response.Code, response.Body.String())
+	}
+	data := publicCodeTestData(t, response)
+	items, _ := data["items"].([]any)
+	if len(items) != 1 || items[0].(map[string]any)["subject"] != "当前输入邮箱邮件" {
+		t.Fatalf("公共页面返回了其他邮箱邮件：%+v", data)
+	}
+}
+
 func TestPublicCodePageStatusReturnsConfiguredDomainNames(t *testing.T) {
 	server, state, _ := newPublicCodeTestServer(t, true)
 	domainSettings := domain.DefaultDomainMailSettings()
@@ -222,6 +253,86 @@ func TestDomainMailboxExternalAPISupportsClaimCodeAndMessages(t *testing.T) {
 	items, _ := listData["items"].([]any)
 	if list.Code != http.StatusOK || listData["mailbox_kind"] != domain.MailboxKindDomainForward || len(items) != 1 {
 		t.Fatalf("域名邮箱外部邮件接口不正确：status=%d data=%+v", list.Code, listData)
+	}
+}
+
+func TestPublicClaimMailboxSupportsAppleAccountFilter(t *testing.T) {
+	state, err := store.Open(filepath.Join(t.TempDir(), "app.db"))
+	if err != nil {
+		t.Fatalf("创建测试数据库失败：%v", err)
+	}
+	t.Cleanup(func() { _ = state.Close() })
+	settings := state.Settings()
+	settings.EnablePublicMailboxAPI = true
+	settings.PublicAPIKey = "account-api-key"
+	if _, err := state.SaveSettings(settings); err != nil {
+		t.Fatalf("保存公共 API 设置失败：%v", err)
+	}
+	first, _, err := state.UpsertMailboxFromRemote("account-first", domain.RemoteMailbox{Email: "first-api@icloud.com", IsActive: true}, "")
+	if err != nil {
+		t.Fatalf("创建第一个测试邮箱失败：%v", err)
+	}
+	second, _, err := state.UpsertMailboxFromRemote("account-second", domain.RemoteMailbox{Email: "second-api@icloud.com", IsActive: true}, "")
+	if err != nil {
+		t.Fatalf("创建第二个测试邮箱失败：%v", err)
+	}
+	secondNewer, _, err := state.UpsertMailboxFromRemote("account-second", domain.RemoteMailbox{Email: "second-newer-api@icloud.com", IsActive: true}, "")
+	if err != nil {
+		t.Fatalf("创建同账号的较新测试邮箱失败：%v", err)
+	}
+	if !first.CreatedAt.Before(second.CreatedAt) {
+		t.Fatalf("测试邮箱创建顺序不正确：first=%v second=%v", first.CreatedAt, second.CreatedAt)
+	}
+	if !second.CreatedAt.Before(secondNewer.CreatedAt) {
+		t.Fatalf("同账号测试邮箱创建顺序不正确：second=%v secondNewer=%v", second.CreatedAt, secondNewer.CreatedAt)
+	}
+	server := New(config.Default(), state, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/mailboxes/claim", strings.NewReader(`{"project":"account-api-test","purpose":"指定 Apple 账号","request_id":"account-claim-1","mailbox_kind":"icloud_hme","account_id":"account-second"}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-API-Key", "account-api-key")
+	claim := httptest.NewRecorder()
+	server.ServeHTTP(claim, request)
+	if claim.Code != http.StatusOK {
+		t.Fatalf("指定 Apple 账号领取接口状态码为 %d：%s", claim.Code, claim.Body.String())
+	}
+	claimedMailbox, _ := publicCodeTestData(t, claim)["mailbox"].(map[string]any)
+	if claimedMailbox["email"] != second.Email || claimedMailbox["account_id"] != second.AccountID {
+		t.Fatalf("指定 Apple 账号领取的邮箱不正确：%+v", claimedMailbox)
+	}
+}
+
+func TestPublicClaimMailboxSupportsAppleIDFilter(t *testing.T) {
+	state, err := store.Open(filepath.Join(t.TempDir(), "app.db"))
+	if err != nil {
+		t.Fatalf("创建测试数据库失败：%v", err)
+	}
+	t.Cleanup(func() { _ = state.Close() })
+	settings := state.Settings()
+	settings.EnablePublicMailboxAPI = true
+	settings.PublicAPIKey = "apple-id-api-key"
+	if _, err := state.SaveSettings(settings); err != nil {
+		t.Fatalf("保存公共 API 设置失败：%v", err)
+	}
+	session, err := state.SaveICloudSession(domain.ICloudSession{AppleID: "visible-id@icloud.com"})
+	if err != nil {
+		t.Fatalf("创建 Apple 账号失败：%v", err)
+	}
+	mailbox, _, err := state.UpsertMailboxFromRemote(session.AccountID, domain.RemoteMailbox{Email: "visible-id-mailbox@icloud.com", IsActive: true}, "")
+	if err != nil {
+		t.Fatalf("创建测试邮箱失败：%v", err)
+	}
+	server := New(config.Default(), state, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/mailboxes/claim", strings.NewReader(`{"project":"apple-id-api-test","purpose":"使用页面显示的 Apple ID","request_id":"apple-id-claim-1","mailbox_kind":"icloud_hme","apple_id":"visible-id@icloud.com"}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-API-Key", "apple-id-api-key")
+	claim := httptest.NewRecorder()
+	server.ServeHTTP(claim, request)
+	if claim.Code != http.StatusOK {
+		t.Fatalf("使用 Apple ID 领取接口状态码为 %d：%s", claim.Code, claim.Body.String())
+	}
+	claimedMailbox, _ := publicCodeTestData(t, claim)["mailbox"].(map[string]any)
+	if claimedMailbox["email"] != mailbox.Email || claimedMailbox["account_id"] != session.AccountID {
+		t.Fatalf("使用 Apple ID 领取的邮箱不正确：%+v", claimedMailbox)
 	}
 }
 

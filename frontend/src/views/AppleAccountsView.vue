@@ -1,6 +1,6 @@
 <script setup>
-import { onBeforeUnmount, onMounted, reactive, ref } from 'vue'
-import { Apple, CheckCircle2, CloudDownload, Eye, EyeOff, KeyRound, LoaderCircle, Mail, MailPlus, Plus, RefreshCw, Server, ShieldCheck, Trash2, X } from '@lucide/vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { Apple, CheckCircle2, CloudDownload, Eye, EyeOff, KeyRound, LoaderCircle, Mail, MailPlus, Plus, Power, RefreshCw, Server, ShieldCheck, Trash2, X } from '@lucide/vue'
 import { api } from '../api/client'
 import CardSelect from '../components/CardSelect.vue'
 import { useConfirm } from '../composables/useConfirm'
@@ -9,6 +9,7 @@ import { useToast } from '../composables/useToast'
 
 const loading = ref(true)
 const busyActions = ref([])
+const checking = computed(() => busyActions.value.some((action) => action === 'check' || action.startsWith('check:')))
 const showLogin = ref(false)
 const showIMAP = ref(false)
 const showCreate = ref(false)
@@ -58,7 +59,7 @@ function finishBusy(action) {
 }
 
 function statusLabel(value) {
-  return ({ active: '正常', partial: '部分正常', need_login: '需要登录', need_2fa: '等待 2FA', no_icloud_plus: '无 iCloud+', rate_limited: '访问受限', failed: '失败' })[value] || value || '未知'
+  return ({ active: '正常', disabled: '已停用', partial: '部分正常', need_login: '需要登录', need_2fa: '等待 2FA', no_icloud_plus: '无 iCloud+', rate_limited: '访问受限', failed: '失败' })[value] || value || '未知'
 }
 
 function stateLabel(kind) {
@@ -86,6 +87,7 @@ function stateStatusClass(state) {
 }
 
 function accountStatusClass(account) {
+  if (account.status === 'disabled') return 'bg-slate-100 text-slate-500 dark:bg-slate-700 dark:text-slate-300'
   const status = account.icloud_status || account.status
   if (status === 'active') return 'bg-emerald-50 text-emerald-600 dark:bg-emerald-950/30 dark:text-emerald-300'
   if (status === 'partial' || status === 'need_2fa' || status === 'need_login') return 'bg-amber-50 text-amber-600 dark:bg-amber-950/30 dark:text-amber-300'
@@ -255,6 +257,7 @@ async function submit2FA() {
 
 async function checkAccount() {
   if (!selected.value) return
+  if (checking.value) return
   if (!startBusy('check')) return
   try {
     const result = await api(`/api/apple-accounts/${selected.value.id}/check`, { method: 'POST' })
@@ -263,8 +266,43 @@ async function checkAccount() {
     await load()
   } catch (err) {
     flash(err.message, true)
+    await load({ silent: true })
   } finally {
     finishBusy('check')
+  }
+}
+
+async function checkState(kind) {
+  if (!selected.value || !kind) return
+  if (checking.value) return
+  const busyKey = `check:${kind}`
+  if (!startBusy(busyKey)) return
+  try {
+    const result = await api(`/api/apple-accounts/${selected.value.id}/check/${encodeURIComponent(kind)}`, { method: 'POST' })
+    selected.value = result.account
+    flash(`${stateLabel(kind)}检测完成`)
+    await load({ silent: true })
+  } catch (err) {
+    flash(err.message, true)
+    await load({ silent: true })
+  } finally {
+    finishBusy(busyKey)
+  }
+}
+
+async function toggleAccount(account) {
+  const enabled = account.status === 'disabled'
+  const busyKey = `status:${account.id}`
+  if (!startBusy(busyKey)) return
+  try {
+    const result = await api(`/api/apple-accounts/${account.id}/status`, { method: 'POST', body: JSON.stringify({ enabled }) })
+    if (selected.value?.id === account.id) selected.value = { ...selected.value, ...result.account }
+    await load({ silent: true })
+    flash(`${account.label || account.apple_id || 'Apple 账号'}已${enabled ? '开启' : '停用'}`)
+  } catch (err) {
+    flash(err.message, true)
+  } finally {
+    finishBusy(busyKey)
   }
 }
 
@@ -351,9 +389,9 @@ onBeforeUnmount(() => {
               <tbody>
                 <tr v-for="account in data.items" :key="account.id" class="apple-account-row" :class="{ 'apple-account-row-selected': selected?.id === account.id }" tabindex="0" :aria-label="`查看 ${account.label || account.apple_id || 'Apple 账号'} 的登录态详情`" @click="selectAccount(account)" @keydown.enter="selectAccount(account)" @keydown.space.prevent="selectAccount(account)">
                   <td><button type="button" class="apple-account-select" :disabled="isBusy(`delete:${account.id}`) || isBusy(`detail:${account.id}`)" @click.stop="selectAccount(account)"><span class="apple-account-icon"><LoaderCircle v-if="isBusy(`detail:${account.id}`)" :size="14" class="animate-spin" /><Apple v-else :size="14" /></span><span><strong>{{ account.label || account.apple_id || 'Apple 账号' }}</strong><small>{{ account.apple_id || account.id }}</small></span></button></td>
-                  <td><span :class="accountStatusClass(account)" class="apple-status-badge">{{ statusLabel(account.icloud_status || account.status) }}</span></td>
+                  <td><span :class="accountStatusClass(account)" class="apple-status-badge">{{ statusLabel(account.status === 'disabled' ? 'disabled' : (account.icloud_status || account.status)) }}</span></td>
                   <td><div class="apple-channel-list"><span v-for="state in account.login_states" :key="state.kind" class="apple-channel-pill"><component :is="stateMeta(state.kind).icon" :size="11" /><span>{{ stateLabel(state.kind) }}</span><em :class="stateStatusClass(state)">{{ stateStatusLabel(state) }}</em></span><span v-if="!account.login_states?.length" class="apple-channel-empty">暂无登录态</span></div></td>
-                  <td><button type="button" class="apple-delete-button" :title="`删除 ${account.label || account.apple_id || 'Apple 账号'}`" :aria-label="`删除 ${account.label || account.apple_id || 'Apple 账号'}`" :disabled="isBusy(`delete:${account.id}`)" @click.stop="deleteAccount(account)"><LoaderCircle v-if="isBusy(`delete:${account.id}`)" :size="13" class="animate-spin" /><Trash2 v-else :size="13" /></button></td>
+                  <td><div class="apple-row-actions"><button type="button" class="apple-toggle-button" :class="{ 'apple-toggle-button-disabled': account.status === 'disabled' }" :title="account.status === 'disabled' ? '开启账号' : '停用账号'" :aria-label="account.status === 'disabled' ? '开启账号' : '停用账号'" :disabled="isBusy(`status:${account.id}`)" @click.stop="toggleAccount(account)"><LoaderCircle v-if="isBusy(`status:${account.id}`)" :size="13" class="animate-spin" /><Power v-else :size="13" /></button><button type="button" class="apple-delete-button" :title="`删除 ${account.label || account.apple_id || 'Apple 账号'}`" :aria-label="`删除 ${account.label || account.apple_id || 'Apple 账号'}`" :disabled="isBusy(`delete:${account.id}`)" @click.stop="deleteAccount(account)"><LoaderCircle v-if="isBusy(`delete:${account.id}`)" :size="13" class="animate-spin" /><Trash2 v-else :size="13" /></button></div></td>
                 </tr>
               </tbody>
             </table>
@@ -363,9 +401,9 @@ onBeforeUnmount(() => {
         <aside class="apple-detail-panel">
           <div v-if="!selected" class="apple-detail-empty"><span><Apple :size="20" /></span><strong>选择一个 Apple 账号</strong><small>登录态详情和检测结果会显示在这里。</small></div>
           <template v-else>
-            <header class="apple-detail-heading"><div><span>所选 Apple 账号</span><h3>{{ selected.label || selected.apple_id }}</h3><p>{{ selected.apple_id }}</p></div><button class="secondary-button apple-check-button" :disabled="isBusy('check')" @click="checkAccount"><LoaderCircle v-if="isBusy('check')" :size="13" class="animate-spin" /><RefreshCw v-else :size="13" />{{ isBusy('check') ? '检查中' : '检测登录态' }}</button></header>
+            <header class="apple-detail-heading"><div><span>所选 Apple 账号</span><h3>{{ selected.label || selected.apple_id }}</h3><p>{{ selected.apple_id }}</p></div><button class="secondary-button apple-check-button" :disabled="checking" @click="checkAccount"><LoaderCircle v-if="checking" :size="13" class="animate-spin" /><RefreshCw v-else :size="13" />{{ checking ? '检查中' : '检测登录态' }}</button></header>
             <div class="apple-state-list">
-              <article v-for="state in selected.login_states" :key="state.kind" class="apple-state-row"><span :class="stateMeta(state.kind).tone" class="apple-state-icon"><component :is="stateMeta(state.kind).icon" :size="14" /></span><span class="apple-state-copy"><strong>{{ stateLabel(state.kind) }}</strong><small>{{ isBusy('check') ? `正在检查 ${stateLabel(state.kind)} 登录态…` : (state.last_status_message || stateMeta(state.kind).description) }}</small></span><span v-if="isBusy('check')" class="apple-state-checking"><LoaderCircle :size="10" class="animate-spin" />检查中</span><span v-else :class="stateStatusClass(state)" class="apple-state-status">{{ stateStatusLabel(state) }}</span></article>
+              <article v-for="state in selected.login_states" :key="state.kind" class="apple-state-row"><span :class="stateMeta(state.kind).tone" class="apple-state-icon"><component :is="stateMeta(state.kind).icon" :size="14" /></span><span class="apple-state-copy"><strong>{{ stateLabel(state.kind) }}</strong><small>{{ isBusy('check') || isBusy(`check:${state.kind}`) ? `正在检查 ${stateLabel(state.kind)} 登录态…` : (state.last_status_message || stateMeta(state.kind).description) }}</small></span><span v-if="isBusy('check') || isBusy(`check:${state.kind}`)" class="apple-state-checking"><LoaderCircle :size="10" class="animate-spin" />检查中</span><template v-else><span :class="stateStatusClass(state)" class="apple-state-status">{{ stateStatusLabel(state) }}</span><button type="button" class="apple-state-check-button" :title="`检测${stateLabel(state.kind)}登录态`" :aria-label="`检测${stateLabel(state.kind)}登录态`" :disabled="checking || !state.saved" @click="checkState(state.kind)"><RefreshCw :size="12" /></button></template></article>
               <div v-if="!selected.login_states?.length" class="apple-state-empty">该账号还没有已保存的登录态</div>
             </div>
           </template>

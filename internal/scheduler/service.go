@@ -134,8 +134,12 @@ func (s *Service) Start(parent context.Context, cfg Config) (State, error) {
 		return State{}, errors.New("请至少选择一个 Apple 账号")
 	}
 	for _, accountID := range cfg.AccountIDs {
-		if _, ok := s.store.FindAppleAccount(accountID); !ok {
+		account, ok := s.store.FindAppleAccount(accountID)
+		if !ok {
 			return State{}, fmt.Errorf("Apple 账号不存在：%s", accountID)
+		}
+		if account.Status == domain.StatusDisabled {
+			return State{}, fmt.Errorf("Apple 账号已停用：%s", accountID)
 		}
 		if _, ok := s.store.ICloudSessionByAccountID(accountID); !ok {
 			return State{}, fmt.Errorf("Apple 账号没有可用登录态：%s", accountID)

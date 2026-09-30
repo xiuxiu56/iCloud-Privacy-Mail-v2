@@ -63,6 +63,41 @@ func TestDomainMailConfigCreatesTypedMailboxesAndFiltersClaims(t *testing.T) {
 	}
 }
 
+func TestClaimMailboxLeaseFiltersByAppleAccountAndKeepsCreatedOrder(t *testing.T) {
+	state, err := Open(filepath.Join(t.TempDir(), "app.db"))
+	if err != nil {
+		t.Fatalf("创建临时数据库失败：%v", err)
+	}
+	defer state.Close()
+	first, _, err := state.UpsertMailboxFromRemote("account-first", domain.RemoteMailbox{Email: "first@icloud.com", IsActive: true}, "")
+	if err != nil {
+		t.Fatalf("创建第一个测试邮箱失败：%v", err)
+	}
+	second, _, err := state.UpsertMailboxFromRemote("account-second", domain.RemoteMailbox{Email: "second@icloud.com", IsActive: true}, "")
+	if err != nil {
+		t.Fatalf("创建第二个测试邮箱失败：%v", err)
+	}
+	secondNewer, _, err := state.UpsertMailboxFromRemote("account-second", domain.RemoteMailbox{Email: "second-newer@icloud.com", IsActive: true}, "")
+	if err != nil {
+		t.Fatalf("创建同账号的较新测试邮箱失败：%v", err)
+	}
+	if !first.CreatedAt.Before(second.CreatedAt) {
+		t.Fatalf("测试邮箱创建顺序不正确：first=%v second=%v", first.CreatedAt, second.CreatedAt)
+	}
+	if !second.CreatedAt.Before(secondNewer.CreatedAt) {
+		t.Fatalf("同账号测试邮箱创建顺序不正确：second=%v secondNewer=%v", second.CreatedAt, secondNewer.CreatedAt)
+	}
+	now := time.Date(2026, 8, 30, 9, 0, 0, 0, time.UTC)
+	selected, _, _, err := state.ClaimMailboxLeaseFiltered("default-project", "默认顺序", "default-1", "", time.Hour, now, MailboxClaimFilter{MailboxKind: domain.MailboxKindICloudHME})
+	if err != nil || selected.ID != first.ID {
+		t.Fatalf("未指定账号时应按创建时间领取第一个邮箱：mailbox=%+v err=%v", selected, err)
+	}
+	selected, _, _, err = state.ClaimMailboxLeaseFiltered("account-project", "指定账号", "account-1", "", time.Hour, now, MailboxClaimFilter{MailboxKind: domain.MailboxKindICloudHME, AccountID: "account-second"})
+	if err != nil || selected.ID != second.ID || selected.AccountID != "account-second" {
+		t.Fatalf("指定 Apple 账号后领取邮箱不正确：mailbox=%+v err=%v", selected, err)
+	}
+}
+
 func TestDomainMailCustomIMAPPasswordIsEncrypted(t *testing.T) {
 	state, err := Open(filepath.Join(t.TempDir(), "app.db"))
 	if err != nil {

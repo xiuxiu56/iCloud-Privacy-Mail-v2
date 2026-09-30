@@ -98,6 +98,10 @@ data/app.db.key
 
 服务启动 1 分钟后执行首轮自动备份，此后每 24 小时备份一次。系统设置页也可以点击“立即备份”。每次备份后默认只保留最新 3 份 `.db` 和 `.db.key` 文件。
 
+## 项目地址
+
+源码仓库：<https://github.com/xiuxiu56/iCloud-Privacy-Mail-v2>
+
 ## 版本与公告
 
 系统设置的更新检查只读取 [`internal/updatecheck/announcements.json`](./internal/updatecheck/announcements.json)。发布新版本时更新 `latest`；项目消息放入 `announcements`。该方式使用 GitHub Raw 公开文件，不请求 GitHub REST API。
@@ -106,10 +110,10 @@ data/app.db.key
 {
   "schema_version": 1,
   "latest": {
-    "version": "2.2.2",
-    "name": "2.2.2 源码版",
-    "notes": "Server 酱通知新增中国时间当日序号，每天 00:00 重置",
-    "published_at": "2026-08-30T21:40:00+08:00",
+    "version": "2.2.3",
+    "name": "2.2.3 源码版",
+    "notes": "邮箱领取筛选、公共取码页和域名原始收件人识别已更新",
+    "published_at": "2026-09-30T00:00:00+08:00",
     "url": "https://github.com/xiuxiu56/iCloud-Privacy-Mail-v2/archive/refs/heads/main.zip"
   },
   "announcements": []
@@ -128,7 +132,7 @@ data/app.db.key
 
 ## 外部邮箱 API
 
-在系统设置中开启“公共取号 API”并设置全局 API Key。领取邮箱时可用 `mailbox_kind` 区分来源：
+在系统设置中开启“公共取号 API”，设置全局 API Key 后调用领取接口。接口会把符合条件的可用邮箱建立租约，重复提交相同的 `project` 和 `request_id` 会返回原租约。
 
 ```http
 POST /api/v1/mailboxes/claim
@@ -136,20 +140,129 @@ X-API-Key: YOUR_API_KEY
 Content-Type: application/json
 ```
 
+### 请求参数
+
+| 参数 | 必填 | 说明 |
+| --- | --- | --- |
+| `project` | 是 | 项目标识，不能为空。 |
+| `purpose` | 否 | 本次领取用途。 |
+| `request_id` | 否 | 请求幂等标识；同一项目重复提交会返回原租约。 |
+| `note` | 否 | 写入邮箱和租约的备注。 |
+| `ttl_seconds` | 否 | 租约秒数；小于 60 秒会按 60 秒处理，超过系统上限会按上限处理。 |
+| `mailbox_kind` | 否 | `icloud_hme`、`domain_forward`、`any` 或留空。 |
+| `domain` | 否 | 只用于 `domain_forward`，按收件域名筛选。 |
+| `apple_id` | 否 | 页面显示的 Apple ID 邮箱，例如 `name@example.com`；系统会自动解析对应账号。 |
+| `account_id` | 否 | 系统内部 Apple 账号 ID，也可以传 Apple ID 邮箱。 |
+
+`apple_id` 和 `account_id` 同时填写时，以 `apple_id` 为准。
+
+### 领取 iCloud 隐私邮箱
+
+#### 从所有 Apple 账号领取
+
+`apple_id` 为空或省略时，从所有符合条件的 iCloud 隐私邮箱中按 `created_at` 从早到晚领取第一个：
+
 ```json
 {
   "project": "注册任务",
   "purpose": "创建账号",
-  "request_id": "request-001",
+  "request_id": "icloud-all-001",
+  "mailbox_kind": "icloud_hme",
+  "apple_id": "",
+  "ttl_seconds": 1800
+}
+```
+
+#### 指定页面显示的 Apple ID
+
+可以直接填写 Apple 账号页面显示的邮箱。系统会先定位账号，再在该账号的隐私邮箱中按 `created_at` 从早到晚领取第一个：
+
+```json
+{
+  "project": "注册任务",
+  "purpose": "创建账号",
+  "request_id": "icloud-account-001",
+  "mailbox_kind": "icloud_hme",
+  "apple_id": "name@example.com",
+  "ttl_seconds": 1800
+}
+```
+
+也可以使用另一个页面显示的 Apple ID：
+
+```json
+{
+  "project": "注册任务",
+  "purpose": "创建账号",
+  "request_id": "icloud-account-002",
+  "mailbox_kind": "icloud_hme",
+  "apple_id": "another-account@example.com"
+}
+```
+
+### 领取域名邮箱
+
+#### 从所有域名邮箱领取
+
+`domain` 为空或省略时，从所有已启用的域名邮箱中按 `created_at` 从早到晚领取第一个：
+
+```json
+{
+  "project": "注册任务",
+  "purpose": "创建账号",
+  "request_id": "domain-all-001",
+  "mailbox_kind": "domain_forward",
+  "domain": "",
+  "ttl_seconds": 1800
+}
+```
+
+#### 指定接收域名
+
+```json
+{
+  "project": "注册任务",
+  "purpose": "创建账号",
+  "request_id": "domain-xiummm-001",
   "mailbox_kind": "domain_forward",
   "domain": "xiummm.com",
   "ttl_seconds": 1800
 }
 ```
 
-- `icloud_hme`：只领取 Apple 隐私邮箱。
-- `domain_forward`：只领取域名邮箱，可用 `domain` 指定接收域名。
-- `any` 或留空：领取任意可用邮箱。
+域名邮箱已绑定 Apple 账号时，也可以同时填写 `apple_id`，在指定域名内继续按 Apple 账号筛选。
+
+### 任意来源邮箱
+
+`mailbox_kind` 填写 `any` 或省略时，会在 iCloud 隐私邮箱和已启用的域名邮箱中统一选择。需要固定来源时，请明确填写 `icloud_hme` 或 `domain_forward`。
+
+### 领取响应
+
+成功响应的 `data` 包含 `mailbox` 和 `lease`：
+
+```json
+{
+  "success": true,
+  "data": {
+    "mailbox": {
+      "email": "example@icloud.com",
+      "account_id": "acc_xxxxxxxxx",
+      "mailbox_kind": "icloud_hme",
+      "status": "reserved"
+    },
+    "lease": {
+      "id": "lease_xxxxxxxxx",
+      "email": "example@icloud.com",
+      "state": "claimed",
+      "expires_at": "2026-09-28T12:00:00Z"
+    },
+    "created": true,
+    "idempotent": false
+  }
+}
+```
+
+没有匹配的可用邮箱时，响应中的 `code` 为 `no_available_mailbox`。Apple ID 不存在时，响应中的 `code` 为 `apple_account_not_found`。
 
 取码、邮件列表和完整正文对两类邮箱使用相同接口，后端会根据邮箱记录选择对应收件链路：
 
@@ -160,6 +273,22 @@ GET /api/v1/mailboxes/{email}/messages/{message_id}
 ```
 
 邮箱独立 API Token、全局 API Key、`X-API-Key` 和 `Authorization: Bearer` 的鉴权方式保持一致。响应中的 `mailbox_kind` 用于确认邮箱来源。
+
+## iCloud Web 邮件同步接口
+
+下面这些是后端内部调用的 iCloud 邮件网关接口，不能直接当作本项目的公共 API 使用。登录态 Cookie、`dsid` 和 `clientId` 由已保存的 iCloud Web 会话提供，文档不保存真实账号或 Cookie。
+
+| 用途 | 接口 |
+| --- | --- |
+| 邮箱夹列表 | `POST /mailws2/v1/geqs/query?clientIntent=fetchMailboxCountQuery` |
+| 增量线程同步 | `POST /mailws2/v1/thread/search`，请求体使用 `THREAD_DIGEST` |
+| 全量线程同步 | `POST /mailws2/v1/thread/search`，请求体使用 `THREAD_ID_AND_DATE` 和 `includeFolderStatus: true` |
+| 线程邮件元数据 | `POST /mailws2/v1/thread/get` |
+| 邮件正文 | `POST /mailws2/v1/message/get` |
+
+邮箱池内容同步的全量和增量流程都使用抓包中的 `thread/search`，再调用 `thread/get` 做收件地址匹配；`fetchCategoryView` 属于网页分类初始化查询，不作为邮箱池内容同步入口。邮件网关请求使用抓包中的 `2634Hotfix39`，门户接口使用 `2634Build50`。Apple 更新网页版本后，应重新抓取并核对构建号、请求体和响应字段。
+
+抓包中还出现了 `fetchMailboxQuery`、`fetchRemindMeQuery`、`fetchAccountPref`、`fetchMostRecentMessageTimestamp` 和 `fetchMessageMetadataByThreadIds`。这些是网页初始化、提醒或批量元数据查询，当前收件同步不依赖它们；如果要完全复刻网页行为，还需要对应的响应体来核对字段。
 
 ## 页面
 
@@ -174,6 +303,25 @@ GET /api/v1/mailboxes/{email}/messages/{message_id}
 ### Apple 账号
 
 ![Apple 账号](./docs/screenshots/02-apple-accounts.jpg)
+
+Apple 账号表格操作列的电源图标用于停用或开启账号。停用后不会参与自动创建、后台邮件监听、邮箱池内容同步或公共取号；登录态和已关联邮箱会保留，重新点击电源图标即可恢复。
+
+账号详情中三个登录通道各自带有检测图标，可以单独检测：
+
+```http
+POST /api/apple-accounts/{id}/check/apple_account
+POST /api/apple-accounts/{id}/check/icloud_web
+POST /api/apple-accounts/{id}/check/icloud_imap
+```
+
+仍可使用 `POST /api/apple-accounts/{id}/check` 一次检测全部已保存通道。账号启停接口为：
+
+```http
+POST /api/apple-accounts/{id}/status
+Content-Type: application/json
+
+{"enabled": false}
+```
 
 ### 邮箱池
 
@@ -194,6 +342,8 @@ GET /api/v1/mailboxes/{email}/messages/{message_id}
 ### 公共邮箱取码
 
 ![公共邮箱取码](./docs/screenshots/07-email-code.jpg)
+
+`/email-code` 的邮件列表、邮件详情和验证码请求只查询当前输入邮箱。域名邮箱按邮件原始收件人识别，页面底部提供开源项目地址。
 
 ## 页面路由
 

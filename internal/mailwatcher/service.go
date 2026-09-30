@@ -23,6 +23,7 @@ const (
 	mailReconcileTimeout   = 5 * time.Minute
 	mailReconcileLookback  = 30 * 24 * time.Hour
 	mailReconcileRetry     = 10 * time.Minute
+	idleReconnectLimit     = 3
 )
 
 type Service struct {
@@ -39,6 +40,8 @@ type Service struct {
 	status          Status
 	readyWorkers    map[string]bool
 	lastPublishedAt time.Time
+	idleMu          sync.Mutex
+	idleCircuits    map[string]idleCircuit
 }
 
 // Status 是后台监听的真实运行快照，区分 IMAP IDLE 和 Web API 低频轮询。
@@ -66,18 +69,25 @@ type Status struct {
 }
 
 type watchGroup struct {
-	key       string
-	session   domain.ICloudSession
-	state     domain.LoginState
-	mailboxes []domain.Mailbox
-	hasIMAP   bool
-	hasWeb    bool
-	signature string
+	key           string
+	session       domain.ICloudSession
+	state         domain.LoginState
+	mailboxes     []domain.Mailbox
+	hasIMAP       bool
+	hasWeb        bool
+	signature     string
+	idleSignature string
 }
 
 type idleWorker struct {
 	cancel    context.CancelFunc
 	signature string
+}
+
+type idleCircuit struct {
+	signature string
+	failures  int
+	disabled  bool
 }
 
 func NewService(cfg config.Config, state *store.Store, mailbox *mailboxservice.Service, logger *slog.Logger) *Service {
@@ -93,6 +103,7 @@ func NewService(cfg config.Config, state *store.Store, mailbox *mailboxservice.S
 		wakeAccounts: make(map[string]bool),
 		activeUntil:  make(map[string]time.Time),
 		readyWorkers: make(map[string]bool),
+		idleCircuits: make(map[string]idleCircuit),
 	}
 	if state != nil {
 		var persisted Status
@@ -304,6 +315,7 @@ func (s *Service) syncWatchGroup(ctx context.Context, group watchGroup, initial,
 	result, err := s.mailbox.SyncMailboxBatchWithOptions(syncCtx, group.mailboxes, mailboxservice.MessageSyncOptions{
 		Mode: protocol.MailSyncModeVerification, Trigger: "watcher", After: after, Limit: limit,
 		UseCursor: true, AllowWebAPI: group.hasWeb, AllowFallback: group.hasWeb, UseWebComplement: group.hasIMAP && group.hasWeb,
+		DisableIMAP: !group.hasIMAP,
 	})
 	cancel()
 	s.recordSyncResult(result, err, webPoll)
@@ -364,6 +376,7 @@ func (s *Service) runIdleWorker(ctx context.Context, group watchGroup) {
 	backoff := time.Second
 	for ctx.Err() == nil {
 		err := protocol.WatchICloudIMAPExists(ctx, group.state, func() {
+			s.markIdleConnected(group.key, group.idleSignature)
 			s.markWorkerReady(group.key, true)
 			s.updateStatus(func(status *Status) {
 				status.LastIdleConnectedAt = time.Now()
@@ -397,7 +410,12 @@ func (s *Service) runIdleWorker(ctx context.Context, group watchGroup) {
 			continue
 		}
 		s.recordWatcherError(err)
-		s.log.Warn("IMAP IDLE 已断开，准备重连", "账号", group.session.AppleID, "邮箱数", len(group.mailboxes), "等待", backoff, "错误", err)
+		failures, disabled := s.recordIdleFailure(group.key, group.idleSignature)
+		if disabled {
+			s.log.Warn("IMAP IDLE 连续重连失败超过3次，已停用该账号的 IMAP IDLE", "账号", group.session.AppleID, "邮箱数", len(group.mailboxes), "失败次数", failures, "错误", err)
+			return
+		}
+		s.log.Warn("IMAP IDLE 已断开，准备重连", "账号", group.session.AppleID, "邮箱数", len(group.mailboxes), "重连失败次数", failures, "等待", backoff, "错误", err)
 		timer := time.NewTimer(backoff)
 		select {
 		case <-ctx.Done():
@@ -494,6 +512,59 @@ func (s *Service) recordWatcherError(err error) {
 	})
 }
 
+func (s *Service) idleCircuitDisabled(key, signature string) bool {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return false
+	}
+	s.idleMu.Lock()
+	defer s.idleMu.Unlock()
+	if s.idleCircuits == nil {
+		s.idleCircuits = make(map[string]idleCircuit)
+	}
+	circuit, found := s.idleCircuits[key]
+	if !found || circuit.signature != signature {
+		if found {
+			delete(s.idleCircuits, key)
+		}
+		return false
+	}
+	return circuit.disabled
+}
+
+func (s *Service) recordIdleFailure(key, signature string) (int, bool) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return 0, false
+	}
+	s.idleMu.Lock()
+	defer s.idleMu.Unlock()
+	if s.idleCircuits == nil {
+		s.idleCircuits = make(map[string]idleCircuit)
+	}
+	circuit := s.idleCircuits[key]
+	if circuit.signature != signature {
+		circuit = idleCircuit{signature: signature}
+	}
+	circuit.failures++
+	circuit.disabled = circuit.failures > idleReconnectLimit
+	s.idleCircuits[key] = circuit
+	return circuit.failures, circuit.disabled
+}
+
+func (s *Service) markIdleConnected(key, signature string) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return
+	}
+	s.idleMu.Lock()
+	defer s.idleMu.Unlock()
+	if s.idleCircuits == nil {
+		s.idleCircuits = make(map[string]idleCircuit)
+	}
+	s.idleCircuits[key] = idleCircuit{signature: signature}
+}
+
 func (s *Service) markWorkerReady(key string, ready bool) {
 	s.updateStatus(func(status *Status) {
 		if ready {
@@ -522,11 +593,12 @@ func (s *Service) groups(allowWebAPI bool) []watchGroup {
 	active := s.activeMailboxIDs(time.Now())
 	domainSettings := s.store.DomainMailSettings()
 	type bucket struct {
-		session   domain.ICloudSession
-		state     domain.LoginState
-		mailboxes []domain.Mailbox
-		hasIMAP   bool
-		hasWeb    bool
+		session       domain.ICloudSession
+		state         domain.LoginState
+		mailboxes     []domain.Mailbox
+		hasIMAP       bool
+		hasWeb        bool
+		idleSignature string
 	}
 	buckets := make(map[string]*bucket)
 	type sessionEntry struct {
@@ -549,13 +621,15 @@ func (s *Service) groups(allowWebAPI bool) []watchGroup {
 					IMAPHost: route.IMAPHost, IMAPPort: route.IMAPPort, IMAPAppPassword: route.IMAPPassword,
 				}
 				hasIMAP := strings.TrimSpace(state.IMAPUsername) != "" && strings.TrimSpace(state.IMAPAppPassword) != ""
+				key := "domain-route:" + route.ID
+				idleSignature := groupSignature(domain.ICloudSession{AccountID: key, AppleID: route.ForwardToEmail}, state, nil)
+				hasIMAP = hasIMAP && !s.idleCircuitDisabled(key, idleSignature)
 				if !hasIMAP {
 					continue
 				}
-				key := "domain-route:" + route.ID
 				item := buckets[key]
 				if item == nil {
-					item = &bucket{session: domain.ICloudSession{AccountID: key, AppleID: route.ForwardToEmail}, state: state, hasIMAP: true}
+					item = &bucket{session: domain.ICloudSession{AccountID: key, AppleID: route.ForwardToEmail}, state: state, hasIMAP: hasIMAP, idleSignature: idleSignature}
 					buckets[key] = item
 				}
 				item.mailboxes = append(item.mailboxes, mailbox)
@@ -570,17 +644,22 @@ func (s *Service) groups(allowWebAPI bool) []watchGroup {
 		if !entry.found {
 			continue
 		}
+		if account, found := s.store.FindAppleAccount(accountID); !found || account.Status == domain.StatusDisabled {
+			continue
+		}
 		session := entry.session
 		imapState, imapSaved := protocol.LoginStateForKind(session, domain.LoginStateICloudIMAP)
 		hasIMAP := imapSaved && strings.TrimSpace(imapState.IMAPEmail) != "" && strings.TrimSpace(imapState.IMAPAppPassword) != ""
 		hasWeb := allowWebAPI && protocol.CanUseICloudWebMail(session)
+		key := firstNonEmpty(session.AccountID, mailbox.AccountID, mailbox.OwnerID, "__mail__")
+		idleSignature := groupSignature(session, imapState, nil)
+		hasIMAP = hasIMAP && !s.idleCircuitDisabled(key, idleSignature)
 		if !hasIMAP && !hasWeb {
 			continue
 		}
-		key := firstNonEmpty(session.AccountID, mailbox.AccountID, mailbox.OwnerID, "__mail__")
 		item := buckets[key]
 		if item == nil {
-			item = &bucket{session: session, state: imapState, hasIMAP: hasIMAP, hasWeb: hasWeb}
+			item = &bucket{session: session, state: imapState, hasIMAP: hasIMAP, hasWeb: hasWeb, idleSignature: idleSignature}
 			buckets[key] = item
 		}
 		item.mailboxes = append(item.mailboxes, mailbox)
@@ -604,7 +683,7 @@ func (s *Service) groups(allowWebAPI bool) []watchGroup {
 		groups = append(groups, watchGroup{
 			key: key, session: item.session, state: item.state, mailboxes: item.mailboxes,
 			hasIMAP: item.hasIMAP, hasWeb: item.hasWeb,
-			signature: groupSignature(item.session, item.state, item.mailboxes),
+			signature: groupSignature(item.session, item.state, item.mailboxes), idleSignature: item.idleSignature,
 		})
 	}
 	return groups

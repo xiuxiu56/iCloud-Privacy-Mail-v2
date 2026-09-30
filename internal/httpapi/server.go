@@ -118,6 +118,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/apple-accounts/login/start", s.protected(s.handleAppleLoginStart))
 	s.mux.HandleFunc("POST /api/apple-accounts/login/2fa", s.protected(s.handleAppleLogin2FA))
 	s.mux.HandleFunc("POST /api/apple-accounts/{id}/check", s.protected(s.handleAppleAccountCheck))
+	s.mux.HandleFunc("POST /api/apple-accounts/{id}/check/{kind}", s.protected(s.handleAppleAccountCheckKind))
+	s.mux.HandleFunc("POST /api/apple-accounts/{id}/status", s.protected(s.handleAppleAccountStatus))
 	s.mux.HandleFunc("POST /api/apple-accounts/{id}/imap", s.protected(s.handleAppleAccountSaveIMAP))
 	s.mux.HandleFunc("POST /api/apple-accounts/{id}/mailboxes", s.protected(s.handleCreatePrivacyMailbox))
 	s.mux.HandleFunc("POST /api/apple-accounts/{id}/mailboxes/sync", s.protected(s.handleSyncPrivacyMailboxes))
@@ -284,6 +286,9 @@ func (s *Server) keepAliveAppleRound(ctx context.Context, baseInterval time.Dura
 	for _, session := range s.store.ICloudSessions() {
 		if ctx.Err() != nil {
 			return
+		}
+		if account, found := s.store.FindAppleAccount(session.AccountID); !found || account.Status == domain.StatusDisabled {
+			continue
 		}
 		state, ok := protocol.LoginStateForKind(session, domain.LoginStateAppleAccount)
 		if !ok || !appleKeepAliveEligible(state) {
@@ -629,6 +634,49 @@ func (s *Server) handleAppleAccountCheck(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusBadGateway, map[string]any{"success": false, "code": "session_check_failed", "message": err.Error(), "data": map[string]any{"account": account}})
 		return
 	}
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": map[string]any{"account": account}})
+}
+
+func (s *Server) handleAppleAccountCheckKind(w http.ResponseWriter, r *http.Request) {
+	kind := r.PathValue("kind")
+	if kind != domain.LoginStateAppleAccount && kind != domain.LoginStateICloudWeb && kind != domain.LoginStateICloudIMAP {
+		writeError(w, http.StatusBadRequest, "invalid_login_state_kind", "登录通道不正确")
+		return
+	}
+	account, err := s.apple.CheckKind(r.Context(), r.PathValue("id"), kind)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"success": false, "code": "session_check_failed", "message": err.Error(), "data": map[string]any{"account": account}})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": map[string]any{"account": account}})
+}
+
+func (s *Server) handleAppleAccountStatus(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Enabled *bool `json:"enabled"`
+	}
+	if err := decodeJSON(r, &body); err != nil || body.Enabled == nil {
+		writeError(w, http.StatusBadRequest, "invalid_status", "enabled 必须是布尔值")
+		return
+	}
+	account, err := s.store.SetAppleAccountEnabled(r.PathValue("id"), *body.Enabled)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	if !*body.Enabled {
+		scheduled := s.scheduler.Snapshot()
+		if scheduled.Running {
+			for _, scheduledID := range scheduled.AccountIDs {
+				if scheduledID == account.ID {
+					s.scheduler.Stop("参与账号已停用，自动创建已停止")
+					break
+				}
+			}
+		}
+	}
+	s.watcher.Wake(account.ID)
+	account.Password = ""
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "data": map[string]any{"account": account}})
 }
 

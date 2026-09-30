@@ -21,6 +21,9 @@ type Service struct {
 	auth             *protocol.AuthFacade
 	client           *protocol.ICloudClient
 	validator        *protocol.ICloudSessionValidator
+	checkApple       func(context.Context, domain.ICloudSession) (domain.ICloudSession, error)
+	checkWeb         func(context.Context, domain.ICloudSession, string) (domain.ICloudSession, error)
+	checkIMAP        func(context.Context, string, string) error
 	pendingMu        sync.Mutex
 	pendingPasswords map[string]pendingPassword
 }
@@ -64,7 +67,7 @@ type AccountSummary struct {
 }
 
 func NewService(cfg config.Config, state *store.Store) *Service {
-	return &Service{
+	service := &Service{
 		cfg:              cfg,
 		store:            state,
 		auth:             protocol.NewAuthFacade(),
@@ -72,6 +75,10 @@ func NewService(cfg config.Config, state *store.Store) *Service {
 		validator:        protocol.NewICloudSessionValidator(),
 		pendingPasswords: make(map[string]pendingPassword),
 	}
+	service.checkApple = service.client.CheckAppleAccountManageSession
+	service.checkWeb = service.validator.ValidateSession
+	service.checkIMAP = protocol.CheckICloudIMAPLogin
+	return service
 }
 
 func (s *Service) StartLogin(ctx context.Context, request LoginRequest) (LoginResult, error) {
@@ -189,15 +196,24 @@ func (s *Service) Account(accountID string) (AccountSummary, error) {
 }
 
 func (s *Service) Check(ctx context.Context, accountID string) (AccountSummary, error) {
+	return s.CheckKind(ctx, accountID, "")
+}
+
+// CheckKind 只检测指定通道；kind 为空时沿用全部通道检测。
+func (s *Service) CheckKind(ctx context.Context, accountID, kind string) (AccountSummary, error) {
+	kind = strings.TrimSpace(kind)
+	if kind != "" && kind != domain.LoginStateAppleAccount && kind != domain.LoginStateICloudWeb && kind != domain.LoginStateICloudIMAP {
+		return AccountSummary{}, errors.New("登录通道不正确")
+	}
 	session, ok := s.store.ICloudSessionByAccountID(accountID)
 	if !ok {
 		return AccountSummary{}, errors.New("Apple 账号登录态不存在")
 	}
 	checkedAny := false
 	var lastErr error
-	if _, ok := protocol.LoginStateForKind(session, domain.LoginStateAppleAccount); ok {
+	if _, ok := protocol.LoginStateForKind(session, domain.LoginStateAppleAccount); ok && (kind == "" || kind == domain.LoginStateAppleAccount) {
 		checkedAny = true
-		updated, err := s.client.CheckAppleAccountManageSession(ctx, session)
+		updated, err := s.checkApple(ctx, session)
 		if err != nil {
 			lastErr = err
 			markLoginState(&session, domain.LoginStateAppleAccount, false, err.Error())
@@ -206,9 +222,10 @@ func (s *Service) Check(ctx context.Context, accountID string) (AccountSummary, 
 			markLoginState(&session, domain.LoginStateAppleAccount, true, "Apple Account 登录态正常")
 		}
 	}
-	if _, ok := protocol.LoginStateForKind(session, domain.LoginStateICloudWeb); ok || len(session.Cookies) > 0 {
+	_, webSaved := protocol.LoginStateForKind(session, domain.LoginStateICloudWeb)
+	if (webSaved || len(session.Cookies) > 0) && (kind == "" || kind == domain.LoginStateICloudWeb) {
 		checkedAny = true
-		updated, err := s.validator.ValidateSession(ctx, session, s.cfg.ICloudDefaultHost)
+		updated, err := s.checkWeb(ctx, session, s.cfg.ICloudDefaultHost)
 		session = updated
 		if err != nil {
 			lastErr = err
@@ -217,9 +234,9 @@ func (s *Service) Check(ctx context.Context, accountID string) (AccountSummary, 
 			markLoginState(&session, domain.LoginStateICloudWeb, true, "iCloud Web 登录态正常")
 		}
 	}
-	if state, ok := protocol.LoginStateForKind(session, domain.LoginStateICloudIMAP); ok {
+	if state, ok := protocol.LoginStateForKind(session, domain.LoginStateICloudIMAP); ok && (kind == "" || kind == domain.LoginStateICloudIMAP) {
 		checkedAny = true
-		err := protocol.CheckICloudIMAPLogin(ctx, state.IMAPEmail, state.IMAPAppPassword)
+		err := s.checkIMAP(ctx, state.IMAPEmail, state.IMAPAppPassword)
 		if err != nil {
 			lastErr = err
 			markLoginState(&session, domain.LoginStateICloudIMAP, false, err.Error())
@@ -228,7 +245,7 @@ func (s *Service) Check(ctx context.Context, accountID string) (AccountSummary, 
 		}
 	}
 	if !checkedAny {
-		return AccountSummary{}, errors.New("该账号没有可检测的登录态")
+		return AccountSummary{}, errors.New("该账号没有可检测的登录态或指定通道未配置")
 	}
 	saved, err := s.store.SaveICloudSession(session)
 	if err != nil {

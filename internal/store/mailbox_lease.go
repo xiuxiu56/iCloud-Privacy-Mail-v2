@@ -26,6 +26,7 @@ var (
 type MailboxClaimFilter struct {
 	MailboxKind string
 	Domain      string
+	AccountID   string
 }
 
 // ClaimMailboxLease 在单个 SQLite 事务中原子执行 available -> reserved。
@@ -33,7 +34,7 @@ func (s *Store) ClaimMailboxLease(project, purpose, requestID, note string, ttl 
 	return s.ClaimMailboxLeaseFiltered(project, purpose, requestID, note, ttl, now, MailboxClaimFilter{})
 }
 
-// ClaimMailboxLeaseFiltered 按邮箱类型和接收域名原子领取邮箱；空筛选保持原接口行为。
+// ClaimMailboxLeaseFiltered 按邮箱类型、接收域名和 Apple 账号原子领取邮箱；空筛选保持原接口行为。
 func (s *Store) ClaimMailboxLeaseFiltered(project, purpose, requestID, note string, ttl time.Duration, now time.Time, filter MailboxClaimFilter) (domain.Mailbox, domain.MailboxLease, bool, error) {
 	project = normalizeLeaseProject(project)
 	if project == "" {
@@ -45,6 +46,7 @@ func (s *Store) ClaimMailboxLeaseFiltered(project, purpose, requestID, note stri
 		filter.MailboxKind = ""
 	}
 	filter.Domain = normalizeDomainName(filter.Domain)
+	filter.AccountID = strings.TrimSpace(filter.AccountID)
 	if filter.MailboxKind != "" && filter.MailboxKind != domain.MailboxKindICloudHME && filter.MailboxKind != domain.MailboxKindDomainForward {
 		return domain.Mailbox{}, domain.MailboxLease{}, false, errors.New("mailbox_kind 只支持 icloud_hme、domain_forward 或留空")
 	}
@@ -111,6 +113,7 @@ func (s *Store) ClaimMailboxLeaseFiltered(project, purpose, requestID, note stri
 		WHERE json_extract(data_json, '$.api_active') = 1
 		AND json_extract(data_json, '$.icloud_active') = 1
 		AND json_extract(data_json, '$.status') = ?
+		AND COALESCE((SELECT json_extract(data_json, '$.status') FROM apple_accounts WHERE id = json_extract(mailboxes.data_json, '$.account_id')), 'active') <> 'disabled'
 		AND COALESCE(json_extract(data_json, '$.active_lease_id'), '') = ''
 		AND (
 			COALESCE(json_extract(data_json, '$.mailbox_kind'), 'icloud_hme') <> 'domain_forward'
@@ -124,6 +127,10 @@ func (s *Store) ClaimMailboxLeaseFiltered(project, purpose, requestID, note stri
 	if filter.Domain != "" {
 		query += ` AND lower(substr(json_extract(data_json, '$.email'), instr(json_extract(data_json, '$.email'), '@') + 1)) = ?`
 		args = append(args, filter.Domain)
+	}
+	if filter.AccountID != "" {
+		query += ` AND json_extract(data_json, '$.account_id') = ?`
+		args = append(args, filter.AccountID)
 	}
 	query += ` ORDER BY json_extract(data_json, '$.created_at') ASC LIMIT 1`
 	err = tx.QueryRow(query, args...).Scan(&mailboxData)
@@ -176,6 +183,9 @@ func (s *Store) ClaimMailboxLeaseFiltered(project, purpose, requestID, note stri
 
 func mailboxMatchesClaimFilter(mailbox domain.Mailbox, filter MailboxClaimFilter) bool {
 	if filter.MailboxKind != "" && normalizeMailboxKind(mailbox.MailboxKind) != filter.MailboxKind {
+		return false
+	}
+	if filter.AccountID != "" && strings.TrimSpace(mailbox.AccountID) != filter.AccountID {
 		return false
 	}
 	if filter.Domain == "" {

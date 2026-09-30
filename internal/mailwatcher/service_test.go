@@ -126,3 +126,57 @@ func TestWebPollDelayUsesBackoffAndBoundedJitter(t *testing.T) {
 		t.Fatalf("Web 失败退避间隔超出预期：%s", retry)
 	}
 }
+
+func TestIdleCircuitDisablesAfterMoreThanThreeReconnectFailures(t *testing.T) {
+	service := &Service{}
+	const accountID = "account-idle-failure"
+	const signature = "imap-signature"
+	for attempt := 1; attempt <= idleReconnectLimit; attempt++ {
+		failures, disabled := service.recordIdleFailure(accountID, signature)
+		if failures != attempt || disabled {
+			t.Fatalf("第 %d 次失败不应停用 IDLE：失败次数=%d disabled=%t", attempt, failures, disabled)
+		}
+	}
+	failures, disabled := service.recordIdleFailure(accountID, signature)
+	if failures != idleReconnectLimit+1 || !disabled {
+		t.Fatalf("超过 3 次重连失败后应停用 IDLE：失败次数=%d disabled=%t", failures, disabled)
+	}
+	if !service.idleCircuitDisabled(accountID, signature) {
+		t.Fatal("已熔断的账号仍被判断为可用")
+	}
+	service.markIdleConnected(accountID, signature)
+	if service.idleCircuitDisabled(accountID, signature) {
+		t.Fatal("成功连接后没有清除 IDLE 熔断状态")
+	}
+}
+
+func TestDisabledIdleAccountFallsBackToWebPolling(t *testing.T) {
+	database, err := store.Open(filepath.Join(t.TempDir(), "app.db"))
+	if err != nil {
+		t.Fatalf("创建 SQLite 数据库失败：%v", err)
+	}
+	defer database.Close()
+	session, err := database.SaveICloudSession(domain.ICloudSession{
+		AppleID: "web-fallback@icloud.com", DSID: "web-fallback-dsid", MailGatewayBaseURL: "https://mail.example.test",
+		Cookies:     []domain.SessionCookie{{Name: "session", Value: "web-cookie"}},
+		LoginStates: []domain.LoginState{{Kind: domain.LoginStateICloudIMAP, IMAPEmail: "web-fallback@icloud.com", IMAPUsername: "web-fallback@icloud.com", IMAPAppPassword: "bad-password"}},
+	})
+	if err != nil {
+		t.Fatalf("创建测试账号失败：%v", err)
+	}
+	if _, _, err := database.UpsertMailboxFromRemote(session.AccountID, domain.RemoteMailbox{Email: "web-fallback-alias@icloud.com", IsActive: true}, ""); err != nil {
+		t.Fatalf("创建测试邮箱失败：%v", err)
+	}
+	service := NewService(config.Default(), database, mailboxservice.NewService(config.Default(), database), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	groups := service.groups(true)
+	if len(groups) != 1 || !groups[0].hasIMAP || !groups[0].hasWeb {
+		t.Fatalf("初始监听分组未同时启用 IMAP 和 Web：%+v", groups)
+	}
+	for attempt := 0; attempt <= idleReconnectLimit; attempt++ {
+		service.recordIdleFailure(groups[0].key, groups[0].idleSignature)
+	}
+	groups = service.groups(true)
+	if len(groups) != 1 || groups[0].hasIMAP || !groups[0].hasWeb {
+		t.Fatalf("IMAP 熔断后没有切换到 Web 轮询：%+v", groups)
+	}
+}

@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -34,6 +36,19 @@ func TestMailHeaderValueReadsFoldedMessageID(t *testing.T) {
 	header := "From: sender@example.com\r\nMessage-ID:\r\n <folded-42@example.com>\r\nSubject: 测试"
 	if value := mailHeaderValue(header, "Message-ID"); value != "<folded-42@example.com>" {
 		t.Fatalf("长邮件头 Message-ID 解析错误：%q", value)
+	}
+}
+
+func TestMailHeaderRecipientsKeepsOriginalForwardRecipient(t *testing.T) {
+	header := "From: sender@example.com\r\nTo: primary@icloud.com\r\nX-Original-To: alias@example.net\r\nDelivered-To: alias@example.net\r\nSubject: 验证码"
+	recipients := mailHeaderRecipients(header)
+	if strings.Contains(strings.ToLower(recipients), "sender@example.com") {
+		t.Fatalf("原始收件人解析不应包含发件人：%q", recipients)
+	}
+	for _, email := range []string{"primary@icloud.com", "alias@example.net"} {
+		if !strings.Contains(strings.ToLower(recipients), email) {
+			t.Fatalf("原始收件人解析缺少 %s：%q", email, recipients)
+		}
 	}
 }
 
@@ -68,6 +83,146 @@ func TestMailThreadSearchBodyKeepsDigestModeForIncrementalSync(t *testing.T) {
 	body := mailThreadSearchBody(mailFolder{Name: "INBOX"}, 20, false)
 	if body["responseType"] != "THREAD_DIGEST" || body["includeFolderStatus"] != false || body["maxResults"] != 20 {
 		t.Fatalf("增量 Web 检索请求体不正确：%+v", body)
+	}
+}
+
+func TestICloudMailEndpointUsesCurrentMailBuild(t *testing.T) {
+	client := NewICloudClient()
+	session := ICloudSession{DSID: "fixture-dsid", ClientBuildNumber: "2622Build20", MasteringNumber: "2622Build20"}
+	mailURL, err := client.endpointWithBase(session, "https://p205-mccgateway.icloud.com.cn", "/mailws2/v1/geqs/query")
+	if err != nil {
+		t.Fatalf("构造 iCloud 邮件接口地址失败：%v", err)
+	}
+	parsed, err := url.Parse(mailURL)
+	if err != nil {
+		t.Fatalf("解析 iCloud 邮件接口地址失败：%v", err)
+	}
+	if parsed.Query().Get("clientBuildNumber") != iCloudMailBuildNumber || parsed.Query().Get("clientMasteringNumber") != iCloudMailBuildNumber {
+		t.Fatalf("邮件接口仍使用旧构建号：%s", parsed.RawQuery)
+	}
+	portalURL, err := client.endpointWithBase(session, "https://p205-premiummailsettings.icloud.com.cn", "/v1/hme/list")
+	if err != nil {
+		t.Fatalf("构造 iCloud 门户接口地址失败：%v", err)
+	}
+	portal, err := url.Parse(portalURL)
+	if err != nil {
+		t.Fatalf("解析 iCloud 门户接口地址失败：%v", err)
+	}
+	if portal.Query().Get("clientBuildNumber") != "2622Build20" {
+		t.Fatalf("非邮件网关接口不应错误套用邮件 Hotfix：%s", portal.RawQuery)
+	}
+}
+
+func TestICloudFetchHeadersMatchCapturedBrowser(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://p205-mccgateway.icloud.com.cn/mailws2/v1/thread/search", nil)
+	if err != nil {
+		t.Fatalf("创建测试请求失败：%v", err)
+	}
+	setICloudFetchHeaders(req, ICloudSession{Host: "www.icloud.com.cn"}, "application/json", "application/json")
+	if req.Header.Get("User-Agent") != iCloudWebUserAgent || req.Header.Get("Sec-CH-UA-Platform") != `"macOS"` {
+		t.Fatalf("请求浏览器标识未对齐抓包：UA=%q platform=%q", req.Header.Get("User-Agent"), req.Header.Get("Sec-CH-UA-Platform"))
+	}
+	if req.Header.Get("Cache-Control") != "no-cache" || req.Header.Get("Pragma") != "no-cache" {
+		t.Fatalf("请求缓存控制头缺失：Cache-Control=%q Pragma=%q", req.Header.Get("Cache-Control"), req.Header.Get("Pragma"))
+	}
+}
+
+func TestICloudFullScanUsesThreadSearchRoute(t *testing.T) {
+	var searchCalls int
+	var threadIDs []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/mailws2/v1/geqs/query":
+			_, _ = w.Write([]byte(`{"domainObjects":[{"identifier":"folder-inbox","name":"INBOX","messageCount":2}]}`))
+			return
+		case "/mailws2/v1/thread/search":
+			searchCalls++
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("解析全量 thread/search 请求失败：%v", err)
+			}
+			if body["responseType"] != "THREAD_ID_AND_DATE" || body["includeFolderStatus"] != true || body["maxResults"] != float64(1000) {
+				t.Fatalf("全量 thread/search 请求体不正确：%+v", body)
+			}
+			_, _ = w.Write([]byte(`{"threadList":[{"threadId":"thread-full-1","subject":"验证码","preview":"验证码 123456","timestamp":1788105600000},{"threadId":"thread-full-2","subject":"验证码","preview":"验证码 654321","timestamp":1788105601000}]}`))
+			return
+		case "/mailws2/v1/thread/get":
+			var body struct {
+				ThreadID string `json:"threadId"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("解析 thread/get 请求失败：%v", err)
+			}
+			threadIDs = append(threadIDs, body.ThreadID)
+			_, _ = w.Write([]byte(`{"messageMetadataList":[{"uid":901,"messageId":"<message-901@example.com>","subject":"验证码","preview":"验证码 123456","date":1788105600000,"from":[{"email":"sender@example.com"}],"to":[{"email":"code@example.com"}]}]}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	client := NewICloudClient()
+	session := ICloudSession{
+		DSID: "fixture-dsid", MailGatewayBaseURL: server.URL, ClientBuildNumber: iCloudMailBuildNumber, MasteringNumber: iCloudMailBuildNumber,
+		Cookies: []SessionCookie{{Name: "X-APPLE-WEBAUTH-TOKEN", Value: "fixture-token"}},
+	}
+	result, err := client.SyncMailboxMessagesBatchWithOptions(context.Background(), session, []Mailbox{{ID: "mailbox-1", Email: "code@example.com"}}, MailSyncOptions{
+		Mode: MailSyncModeAllRecent, FullScan: true, UseCursor: false,
+	})
+	if err != nil {
+		t.Fatalf("全量 Web 同步失败：%v", err)
+	}
+	if searchCalls != 1 || !reflect.DeepEqual(threadIDs, []string{"thread-full-1", "thread-full-2"}) {
+		t.Fatalf("全量同步没有通过 thread/search 取线程：searchCalls=%d threadIDs=%v", searchCalls, threadIDs)
+	}
+	messages := result.MessagesByMailbox["mailbox-1"]
+	if len(messages) != 2 || messages[0].UID != "901" {
+		t.Fatalf("全量同步收件人匹配结果不正确：%+v", messages)
+	}
+}
+
+func TestICloudIncrementalSyncKeepsThreadSearchRoute(t *testing.T) {
+	var searchCalled bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/mailws2/v1/geqs/query":
+			_, _ = w.Write([]byte(`{"domainObjects":[{"identifier":"folder-inbox","name":"INBOX","messageCount":1}]}`))
+		case "/mailws2/v1/thread/search":
+			searchCalled = true
+			if r.URL.Query().Get("clientIntent") != "" || r.URL.Query().Get("clientBuildNumber") != iCloudMailBuildNumber {
+				t.Fatalf("增量 thread/search 查询参数不符合抓包：%s", r.URL.RawQuery)
+			}
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("解析增量 thread/search 请求失败：%v", err)
+			}
+			if body["responseType"] != "THREAD_DIGEST" || body["includeFolderStatus"] != false {
+				t.Fatalf("增量 thread/search 请求体不正确：%+v", body)
+			}
+			_, _ = w.Write([]byte(`{"threadList":[{"threadId":"thread-incremental","subject":"登录验证码","preview":"验证码 654321","timestamp":1788105600000}]}`))
+		case "/mailws2/v1/thread/get":
+			_, _ = w.Write([]byte(`{"messageMetadataList":[{"uid":902,"messageId":"<message-902@example.com>","subject":"登录验证码","preview":"验证码 654321","date":1788105600000,"from":[{"email":"sender@example.com"}],"to":[{"email":"code@example.com"}]}]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := NewICloudClient()
+	session := ICloudSession{
+		DSID: "fixture-dsid", MailGatewayBaseURL: server.URL, ClientBuildNumber: iCloudMailBuildNumber, MasteringNumber: iCloudMailBuildNumber,
+		Cookies: []SessionCookie{{Name: "X-APPLE-WEBAUTH-TOKEN", Value: "fixture-token"}},
+	}
+	result, err := client.SyncMailboxMessagesBatchWithOptions(context.Background(), session, []Mailbox{{ID: "mailbox-1", Email: "code@example.com"}}, MailSyncOptions{
+		Mode: MailSyncModeVerification, Keyword: "验证码", Limit: 20,
+	})
+	if err != nil {
+		t.Fatalf("增量 Web 同步失败：%v", err)
+	}
+	if !searchCalled || len(result.MessagesByMailbox["mailbox-1"]) != 1 {
+		t.Fatalf("增量同步没有通过 thread/search 取到邮件：%+v", result)
 	}
 }
 
@@ -198,19 +353,13 @@ func TestFindRemoteMessageIDsByMailboxIncludesTrash(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/mailws2/v1/geqs/query":
-			_, _ = w.Write([]byte(`{"domainObjects":[{"identifier":"folder-inbox","name":"INBOX","messageCount":0},{"identifier":"folder-trash","name":"Deleted Messages","messageCount":1}]}`))
-		case "/mailws2/v1/thread/search":
-			var body struct {
-				SessionHeaders map[string]any `json:"sessionHeaders"`
-			}
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-				t.Fatalf("解析邮件线程检索请求失败：%v", err)
-			}
-			if body.SessionHeaders["folder"] == "Deleted Messages" {
-				_, _ = w.Write([]byte(`{"threadList":[{"threadId":"trash-thread","timestamp":1788105600000}]}`))
+			if r.URL.Query().Get("clientIntent") == "fetchMailboxCountQuery" {
+				_, _ = w.Write([]byte(`{"domainObjects":[{"identifier":"folder-inbox","name":"INBOX","messageCount":0},{"identifier":"folder-trash","name":"Deleted Messages","messageCount":1}]}`))
 				return
 			}
-			_, _ = w.Write([]byte(`{"threadList":[]}`))
+			_, _ = w.Write([]byte(`{"domainObjects":[{"identifier":"email-trash","appleThrid":"trash-thread","emailMatchTimestamp":1788105600000}]}`))
+		case "/mailws2/v1/thread/search":
+			t.Fatalf("全量远程扫描不应继续调用 thread/search")
 		case "/mailws2/v1/thread/get":
 			_, _ = w.Write([]byte(`{"messageMetadataList":[{"uid":909,"folder":"Deleted Messages","to":[{"email":"code@example.com"}]}]}`))
 		default:
