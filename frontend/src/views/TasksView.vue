@@ -18,6 +18,8 @@ const defaultForm = reactive({ mode: 'once', label: '', note: '', account_ids: [
 const { success, error: showError } = useToast()
 const { confirm: confirmAction } = useConfirm()
 let schedulerRefreshTimer = 0
+let elapsedTimer = 0
+const elapsedNow = ref(Date.now())
 let realtimeRefreshTimer = 0
 let realtimeUnsubscribe = () => {}
 let autoSaveTimer = 0
@@ -66,6 +68,20 @@ const nextRunSummary = computed(() => {
   if (scheduler.value.next_run_at) return formatTime(scheduler.value.next_run_at)
   if (scheduler.value.status === 'creating') return '本轮执行中'
   return '准备执行'
+})
+const totalRunTime = computed(() => {
+  const started = new Date(scheduler.value.started_at || '').getTime()
+  if (!Number.isFinite(started) || new Date(started).getFullYear() <= 1) return '—'
+  const stopped = new Date(scheduler.value.stopped_at || '').getTime()
+  const ended = scheduler.value.running || !Number.isFinite(stopped) || new Date(stopped).getFullYear() <= 1
+    ? elapsedNow.value
+    : stopped
+  const seconds = Math.max(0, Math.floor((ended - started) / 1000))
+  const days = Math.floor(seconds / 86400)
+  const hours = String(Math.floor((seconds % 86400) / 3600)).padStart(2, '0')
+  const minutes = String(Math.floor((seconds % 3600) / 60)).padStart(2, '0')
+  const remainder = String(seconds % 60).padStart(2, '0')
+  return `${days ? `${days} 天 ` : ''}${hours}:${minutes}:${remainder}`
 })
 
 const createChannelOptions = [
@@ -391,6 +407,7 @@ onMounted(() => {
   load()
   realtimeUnsubscribe = subscribeRealtime(['scheduler', 'apple-account', 'create-settings'], scheduleRealtimeRefresh)
   schedulerRefreshTimer = window.setInterval(refreshScheduler, 30000)
+  elapsedTimer = window.setInterval(() => { elapsedNow.value = Date.now() }, 1000)
   logLayoutObserver = new ResizeObserver(scheduleLogViewportHeight)
   logLayoutObserver.observe(document.querySelector('.page-scroll'))
   window.addEventListener('resize', scheduleLogViewportHeight)
@@ -409,6 +426,7 @@ watch([loading, () => scheduler.value.last_error], async () => {
 onBeforeUnmount(() => {
   schedulerRefreshVersion++
   window.clearInterval(schedulerRefreshTimer)
+  window.clearInterval(elapsedTimer)
   window.clearTimeout(realtimeRefreshTimer)
   if (autoSavePending) {
     window.clearTimeout(autoSaveTimer)
@@ -464,6 +482,7 @@ onBeforeUnmount(() => {
           <dl><dt>轮次间隔</dt><dd>{{ scheduler.running || form.mode === 'scheduled' ? intervalSummary : '—' }}</dd></dl>
           <dl class="task-summary-wide"><dt>下次执行</dt><dd>{{ nextRunSummary }}</dd></dl>
           <dl class="task-summary-wide"><dt>最近执行</dt><dd>{{ formatTime(scheduler.last_run_at) }}</dd></dl>
+          <dl class="task-summary-wide"><dt>总运行时间</dt><dd>{{ totalRunTime }}</dd></dl>
         </div>
 
         <div v-if="scheduler.last_error" class="task-notice-row" aria-live="polite">

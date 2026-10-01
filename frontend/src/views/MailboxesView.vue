@@ -1,6 +1,6 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { Boxes, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, Clipboard, CloudDownload, CloudOff, KeyRound, LoaderCircle, MailOpen, MailPlus, RefreshCw, Save, Search, ShieldX, Trash2, X } from '@lucide/vue'
+import { Boxes, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, Clipboard, CloudDownload, CloudOff, KeyRound, Link2, LoaderCircle, MailOpen, MailPlus, RefreshCw, Save, Search, ShieldX, Trash2, X } from '@lucide/vue'
 import { api } from '../api/client'
 import CardSelect from '../components/CardSelect.vue'
 import FormDialog from '../components/FormDialog.vue'
@@ -191,6 +191,21 @@ async function copyMailboxEmail(mailbox) {
     flash(`邮箱已复制：${mailbox.email}`)
   } catch (err) {
     flash(err.message || '复制邮箱失败，请重试', true)
+  }
+}
+
+async function copyMailboxCodeAPI(mailbox) {
+  const email = String(mailbox?.email || '').trim()
+  if (!email) {
+    flash('邮箱地址为空，无法复制取码 API 链接', true)
+    return
+  }
+  const url = `${window.location.origin}/api/v1/public-code?email=${encodeURIComponent(email)}&wait_ms=15000`
+  try {
+    await copyText(url)
+    flash(`取码 API 链接已复制：${email}`)
+  } catch (err) {
+    flash(err.message || '复制取码 API 链接失败，请重试', true)
   }
 }
 
@@ -1367,6 +1382,7 @@ onBeforeUnmount(() => {
                 <div class="mailbox-row-actions">
                   <button class="mailbox-action-button mailbox-action-sync" :class="{ 'mailbox-action-sync-selected': rowBusyAction(mailbox.id) === 'sync' }" :disabled="Boolean(rowBusyAction(mailbox.id)) || isMailboxDeleteBusy(mailbox.id)" :title="mailboxMessageSyncHint" @click.stop="quickSyncMailbox(mailbox)"><LoaderCircle v-if="rowBusyAction(mailbox.id) === 'sync'" :size="12" class="animate-spin" /><RefreshCw v-else :size="12" />同步</button>
                   <button class="mailbox-action-button mailbox-action-code" :class="{ 'mailbox-action-code-selected': rowBusyAction(mailbox.id) === 'code' || (codeDialogOpen && codeMailbox?.id === mailbox.id) }" :disabled="Boolean(rowBusyAction(mailbox.id)) || isMailboxDeleteBusy(mailbox.id)" title="获取该邮箱的最新验证码" @click.stop="quickGetCode(mailbox)"><LoaderCircle v-if="codeBusyVisible === `code-row:${mailbox.id}`" :size="12" class="animate-spin" /><KeyRound v-else :size="12" />取码</button>
+                  <button type="button" class="mailbox-action-button mailbox-action-api" :disabled="isMailboxDeleteBusy(mailbox.id)" :title="`复制 ${mailbox.email} 的取码 API 链接；需开启公共邮箱取码页面及该邮箱 API`" :aria-label="`复制 ${mailbox.email} 的取码 API 链接`" @click.stop="copyMailboxCodeAPI(mailbox)"><Link2 :size="12" />API</button>
                   <button class="mailbox-action-button mailbox-action-detail" :class="{ 'mailbox-action-detail-selected': selected?.id === mailbox.id }" :disabled="Boolean(rowBusyAction(mailbox.id)) || isMailboxDeleteBusy(mailbox.id)" title="查看邮箱详情" @click.stop="openMailbox(mailbox)"><LoaderCircle v-if="rowBusyAction(mailbox.id) === 'detail'" :size="12" class="animate-spin" /><MailOpen v-else :size="12" />详情</button>
                   <button class="mailbox-action-button mailbox-action-delete" :class="{ 'mailbox-action-delete-selected': isMailboxDeleteBusy(mailbox.id) }" :disabled="Boolean(rowBusyAction(mailbox.id)) || isMailboxDeleteBusy(mailbox.id)" :title="isMailboxDeleting(mailbox.id) ? '正在清理已同步邮件并删除隐私邮箱' : isMailboxDeleteQueued(mailbox.id) ? '已加入彻底删除队列' : '清理已同步的远端邮件后彻底删除隐私邮箱'" @click.stop="removeMailboxFromRow(mailbox)"><LoaderCircle v-if="isMailboxDeleting(mailbox.id)" :size="12" class="animate-spin" /><LoaderCircle v-else-if="isMailboxDeleteQueued(mailbox.id)" :size="12" class="animate-spin" /><Trash2 v-else :size="12" />{{ isMailboxDeleting(mailbox.id) ? '删除中' : isMailboxDeleteQueued(mailbox.id) ? '排队中' : '删除' }}</button>
                 </div>

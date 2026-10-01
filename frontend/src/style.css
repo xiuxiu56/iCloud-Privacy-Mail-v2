@@ -303,7 +303,7 @@ textarea.field {
 
 .mailbox-pool-table {
   width: 100%;
-  min-width: 1340px;
+  min-width: 1400px;
   border-collapse: collapse;
   table-layout: fixed;
   color: var(--app-text);
@@ -388,7 +388,7 @@ textarea.field {
 }
 
 .mailbox-col-actions {
-  width: 270px;
+  width: 330px;
 }
 
 .mailbox-select-all,
@@ -3162,6 +3162,10 @@ textarea.field {
   @apply border-amber-400 bg-amber-200 text-amber-900 ring-2 ring-amber-300/40 dark:border-amber-500 dark:bg-amber-800 dark:text-amber-50 dark:ring-amber-500/30;
 }
 
+.mailbox-action-api {
+  @apply border-emerald-200 bg-emerald-50 text-emerald-700 hover:border-emerald-300 hover:bg-emerald-100 active:border-emerald-400 active:bg-emerald-200 active:text-emerald-900 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-300 dark:hover:border-emerald-700 dark:hover:bg-emerald-900/60 dark:active:border-emerald-500 dark:active:bg-emerald-800 dark:active:text-emerald-50;
+}
+
 .mailbox-action-detail {
   @apply border-violet-200 bg-violet-50 text-violet-700 hover:border-violet-300 hover:bg-violet-100 active:border-violet-400 active:bg-violet-200 active:text-violet-900 dark:border-violet-900 dark:bg-violet-950/40 dark:text-violet-300 dark:hover:border-violet-700 dark:hover:bg-violet-900/60 dark:active:border-violet-500 dark:active:bg-violet-800 dark:active:text-violet-50;
 }
@@ -5268,7 +5272,7 @@ textarea.field {
 .task-summary {
   min-width: 0;
   display: grid;
-  grid-template-columns: 170px repeat(5, minmax(86px, 1fr)) minmax(124px, 1.15fr) minmax(124px, 1.15fr);
+  grid-template-columns: 170px repeat(5, minmax(86px, 1fr)) repeat(3, minmax(124px, 1.15fr));
   border-bottom: 1px solid var(--app-line);
   background: var(--app-surface);
 }
@@ -5800,7 +5804,7 @@ textarea.field {
   }
 
   .task-summary {
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
   .task-summary-title,
@@ -5809,11 +5813,11 @@ textarea.field {
     border-bottom: 1px solid var(--app-line);
   }
 
-  .task-summary > :nth-last-child(-n+4) {
+  .task-summary > :nth-last-child(-n+3) {
     border-bottom: 0;
   }
 
-  .task-summary > :nth-child(4n) {
+  .task-summary > :nth-child(3n) {
     border-right: 0;
   }
 }
@@ -5915,6 +5919,7 @@ textarea.field {
   }
 
   .task-summary > * {
+    border-right: 1px solid var(--app-line);
     border-bottom: 1px solid var(--app-line) !important;
   }
 
@@ -5922,7 +5927,9 @@ textarea.field {
     border-right: 0;
   }
 
-  .task-summary > :nth-last-child(-n+2) {
+  .task-summary > :last-child {
+    grid-column: 1 / -1;
+    border-right: 0;
     border-bottom: 0 !important;
   }
 

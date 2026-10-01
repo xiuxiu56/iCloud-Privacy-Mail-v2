@@ -110,11 +110,11 @@ data/app.db.key
 {
   "schema_version": 1,
   "latest": {
-    "version": "2.2.3",
-    "name": "2.2.3 源码版",
-    "notes": "邮箱领取筛选、公共取码页和域名原始收件人识别已更新",
-    "published_at": "2026-09-30T00:00:00+08:00",
-    "url": "https://github.com/xiuxiu56/iCloud-Privacy-Mail-v2/archive/refs/heads/main.zip"
+    "version": "2.2.4",
+    "name": "2.2.4 源码版",
+    "notes": "自动创建单账号失败退出、总运行时间及邮箱池取码 API 链接已更新",
+    "published_at": "2026-10-01T18:28:02+08:00",
+    "url": "https://github.com/xiuxiu56/iCloud-Privacy-Mail-v2/archive/refs/heads/domain-mailbox-system.zip"
   },
   "announcements": []
 }

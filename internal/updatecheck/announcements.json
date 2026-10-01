@@ -1,13 +1,22 @@
 {
   "schema_version": 1,
   "latest": {
-    "version": "2.2.3",
-    "name": "2.2.3 源码版",
-    "notes": "邮箱领取筛选、公共取码页和域名原始收件人识别已更新。请从开源仓库重新下载并构建。",
-    "published_at": "2026-09-30T00:00:00+08:00",
-    "url": "https://github.com/xiuxiu56/iCloud-Privacy-Mail-v2/archive/refs/heads/main.zip"
+    "version": "2.2.4",
+    "name": "2.2.4 源码版",
+    "notes": "自动创建改为单账号失败即退出，其他账号继续；任务概览新增总运行时间，邮箱池新增取码 API 链接复制按钮。请从开源仓库重新下载并构建。",
+    "published_at": "2026-10-01T18:28:02+08:00",
+    "url": "https://github.com/xiuxiu56/iCloud-Privacy-Mail-v2/archive/refs/heads/domain-mailbox-system.zip"
   },
   "announcements": [
+    {
+      "id": "source-version-2-2-4",
+      "type": "update",
+      "title": "2.2.4 自动创建与取码快捷入口已更新",
+      "summary": "创建失败只让对应 Apple 账号退出；任务运行时间实时显示，邮箱池可复制取码 API 链接。",
+      "content": "自动创建任务中，某个 Apple 账号创建失败后立即退出本次任务，其他账号继续当前轮及后续轮次；只有所有参与账号都各自失败时才结束整个任务。创建隐私邮箱页面在“最近执行”右侧显示总运行时间，手动停止或全部失败时定格。邮箱池表格的“取码”右侧新增 API 按钮，可复制该邮箱的公共取码请求链接；使用前需开启公共取码功能及该邮箱的 API 权限。",
+      "published_at": "2026-10-01T18:28:02+08:00",
+      "url": "https://github.com/xiuxiu56/iCloud-Privacy-Mail-v2/archive/refs/heads/domain-mailbox-system.zip"
+    },
     {
       "id": "source-version-2-2-3",
       "type": "update",

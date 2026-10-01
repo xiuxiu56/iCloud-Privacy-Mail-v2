@@ -44,6 +44,7 @@ type State struct {
 	Running                       bool      `json:"running"`
 	Status                        string    `json:"status"`
 	AccountIDs                    []string  `json:"account_ids"`
+	FailedAccountIDs              []string  `json:"failed_account_ids"`
 	Label                         string    `json:"label"`
 	Note                          string    `json:"note"`
 	CreateChannel                 string    `json:"create_channel"`
@@ -133,18 +134,6 @@ func (s *Service) Start(parent context.Context, cfg Config) (State, error) {
 	if len(cfg.AccountIDs) == 0 {
 		return State{}, errors.New("请至少选择一个 Apple 账号")
 	}
-	for _, accountID := range cfg.AccountIDs {
-		account, ok := s.store.FindAppleAccount(accountID)
-		if !ok {
-			return State{}, fmt.Errorf("Apple 账号不存在：%s", accountID)
-		}
-		if account.Status == domain.StatusDisabled {
-			return State{}, fmt.Errorf("Apple 账号已停用：%s", accountID)
-		}
-		if _, ok := s.store.ICloudSessionByAccountID(accountID); !ok {
-			return State{}, fmt.Errorf("Apple 账号没有可用登录态：%s", accountID)
-		}
-	}
 
 	s.mu.Lock()
 	if s.state.Running {
@@ -160,6 +149,7 @@ func (s *Service) Start(parent context.Context, cfg Config) (State, error) {
 		Running:                       true,
 		Status:                        "running",
 		AccountIDs:                    append([]string(nil), cfg.AccountIDs...),
+		FailedAccountIDs:              []string{},
 		Label:                         cfg.Label,
 		Note:                          cfg.Note,
 		CreateChannel:                 cfg.CreateChannel,
@@ -290,9 +280,28 @@ func (s *Service) runRound(ctx context.Context, cfg Config, generation uint64) {
 	s.state.LastRunAt = time.Now()
 	s.state.NextRunAt = time.Time{}
 	s.addEventLocked(Event{Type: "round_started", Message: fmt.Sprintf("开始第 %d 轮定时创建", batch)})
+	failed := make(map[string]bool, len(s.state.FailedAccountIDs))
+	for _, accountID := range s.state.FailedAccountIDs {
+		failed[accountID] = true
+	}
 	s.mu.Unlock()
 
-	for index, accountID := range cfg.AccountIDs {
+	activeIDs := make([]string, 0, len(cfg.AccountIDs))
+	for _, accountID := range cfg.AccountIDs {
+		if !failed[accountID] {
+			activeIDs = append(activeIDs, accountID)
+		}
+	}
+	if len(activeIDs) == 0 {
+		s.mu.Lock()
+		if generation == s.generation && s.state.Running {
+			s.stopAfterAllAccountsFailedLocked()
+		}
+		s.mu.Unlock()
+		return
+	}
+
+	for index, accountID := range activeIDs {
 		if ctx.Err() != nil {
 			return
 		}
@@ -305,26 +314,19 @@ func (s *Service) runRound(ctx context.Context, cfg Config, generation uint64) {
 		if err != nil {
 			s.state.Failed++
 			s.state.LastError = err.Error()
-			s.state.Running = false
-			s.state.Status = "stopped"
-			s.state.NextRunAt = time.Time{}
-			s.state.StoppedAt = time.Now()
-			if s.cancel != nil {
-				s.cancel()
-				s.cancel = nil
+			s.state.FailedAccountIDs = append(s.state.FailedAccountIDs, accountID)
+			s.addEventLocked(Event{Type: "failed", AccountID: accountID, Label: cfg.Label, Message: "创建隐私邮箱失败，该账号已退出自动创建", Error: err.Error()})
+			if len(s.state.FailedAccountIDs) >= len(s.state.AccountIDs) {
+				s.stopAfterAllAccountsFailedLocked()
+				s.mu.Unlock()
+				return
 			}
-			s.generation++
-			s.addEventLocked(Event{Type: "failed", AccountID: accountID, Label: cfg.Label, Message: "创建隐私邮箱失败", Error: err.Error()})
-			s.addEventLocked(Event{Type: "stopped", Message: "创建失败，自动创建已停止"})
-			s.mu.Unlock()
-			return
 		} else {
 			s.state.Success++
-			s.state.LastError = ""
 			s.addEventLocked(Event{Type: "created", AccountID: accountID, MailboxID: mailbox.ID, Email: mailbox.Email, Label: mailbox.Label, Message: "已创建隐私邮箱 " + mailbox.Email})
 		}
 		s.mu.Unlock()
-		if index < len(cfg.AccountIDs)-1 && cfg.AccountIntervalMaxSeconds > 0 {
+		if index < len(activeIDs)-1 && cfg.AccountIntervalMaxSeconds > 0 {
 			accountIntervalSeconds := randomBetween(cfg.AccountIntervalMinSeconds, cfg.AccountIntervalMaxSeconds)
 			s.mu.Lock()
 			if generation == s.generation && s.state.Running {
@@ -340,6 +342,19 @@ func (s *Service) runRound(ctx context.Context, cfg Config, generation uint64) {
 			}
 		}
 	}
+}
+
+func (s *Service) stopAfterAllAccountsFailedLocked() {
+	s.state.Running = false
+	s.state.Status = "stopped"
+	s.state.NextRunAt = time.Time{}
+	s.state.StoppedAt = time.Now()
+	if s.cancel != nil {
+		s.cancel()
+		s.cancel = nil
+	}
+	s.generation++
+	s.addEventLocked(Event{Type: "stopped", Message: "所有参与账号创建失败，自动创建已停止"})
 }
 
 func (s *Service) finish(generation uint64) {
@@ -449,6 +464,7 @@ func (s *Service) publishLocked() {
 func (s *Service) snapshotLocked() State {
 	out := s.state
 	out.AccountIDs = append([]string(nil), s.state.AccountIDs...)
+	out.FailedAccountIDs = append([]string(nil), s.state.FailedAccountIDs...)
 	out.Events = append([]Event(nil), s.state.Events...)
 	return out
 }

@@ -7,7 +7,7 @@ APP_COMMIT="$(git -C "$PROJECT_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)
 APP_BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 if [[ -z "$APP_VERSION" ]]; then
-  APP_VERSION="2.2.3"
+  APP_VERSION="2.2.4"
 fi
 
 BUILD_LDFLAGS="-s -w -X icloud-privacy-mail-v2/internal/buildinfo.Version=$APP_VERSION -X icloud-privacy-mail-v2/internal/buildinfo.Commit=$APP_COMMIT -X icloud-privacy-mail-v2/internal/buildinfo.BuiltAt=$APP_BUILT_AT"
