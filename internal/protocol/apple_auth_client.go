@@ -59,6 +59,8 @@ type appleAuthSession struct {
 	FrameID             string
 	UserAgent           string
 	SessionToken        string
+	DSID                string
+	PortalClientID      string
 	Scnt                string
 	ManageScnt          string
 	SessionID           string
@@ -304,17 +306,30 @@ func (c *AppleAuthClient) startLoginOnHost(ctx context.Context, appleID, passwor
 		session.TwoFactorMethod = normalizeAppleTwoFactorMethod(twoFactorMethod)
 		message := "已触发 Apple 2FA，请在受信任设备允许后输入 6 位验证码"
 		if session.TwoFactorMethod == appleTwoFactorMethodPhone {
+			// 页面刷新用于补齐受信任手机号；部分账号会拒绝这次页面请求，
+			// 此时仍让 Apple 按默认手机号发送验证码。
 			_ = c.refreshAuthState(ctx, session)
+			// 网页会在提交验证码前先调用一次 accountLogin，取得 DSID 和基础 Cookie；
+			// 验证码通过后再次调用时必须沿用这些值，Apple 才会下发完整 Web Token。
+			_ = c.primeICloudAccountLogin(ctx, session)
 			if err := c.requestPhoneSecurityCode(ctx, session, nil); err != nil {
 				return appleAuthStartResult{}, err
 			}
 			message = "已向受信任手机号发送短信验证码，请输入 6 位验证码"
-		} else if err := c.requestTrustedDeviceCode(ctx, session); err != nil {
-			var redirect appleDomainRedirectError
-			if errors.As(err, &redirect) {
-				return appleAuthStartResult{}, err
+		} else {
+			// 刷新页面可取得最新 scnt；部分账号只在此后才会真正触发设备推送。
+			_ = c.refreshAuthState(ctx, session)
+			// Mac 弹窗分支同样需要在提交设备验证码前建立基础 iCloud 会话。
+			_ = c.primeICloudAccountLogin(ctx, session)
+			if err := c.requestTrustedDeviceCode(ctx, session); err != nil {
+				var redirect appleDomainRedirectError
+				if errors.As(err, &redirect) {
+					return appleAuthStartResult{}, err
+				}
+				// 设备验证码可能已经由 signin/complete 自动推送；触发接口
+				// 返回错误时保留待验证会话，让用户仍可提交设备上的验证码。
+				message = "Apple 已要求 2FA；设备推送状态未确认，请查看受信任设备后输入验证码"
 			}
-			message = "Apple 已要求 2FA；自动触发验证码未确认，请查看受信任设备后输入验证码"
 		}
 		pending, err := pendingStore.put(session)
 		if err != nil {
@@ -419,8 +434,10 @@ func appleAuthEndpointsForHost(host string) appleAuthEndpoints {
 		return appleAuthEndpoints{
 			Home:  "https://www.icloud.com.cn",
 			Setup: "https://setup.icloud.com.cn/setup/ws/1",
-			Auth:  "https://idmsa.apple.com.cn/appleauth/auth",
-			Host:  "www.icloud.com.cn",
+			// 中国区 iCloud 网页抓包的 Apple 认证仍使用全球 idmsa.apple.com；
+			// 只有 iCloud 门户和 setup 服务使用 .com.cn。
+			Auth: "https://idmsa.apple.com/appleauth/auth",
+			Host: "www.icloud.com.cn",
 		}
 	}
 	return appleAuthEndpoints{
@@ -632,8 +649,30 @@ func leadingZeroBits(data []byte) int {
 }
 
 func (c *AppleAuthClient) requestTrustedDeviceCode(ctx context.Context, session *appleAuthSession) error {
-	_, _, err := c.do(ctx, session, http.MethodPut, session.Endpoints.Auth+"/verify/trusteddevice/securitycode", session.twoFactorHeaders(), nil, nil, false)
-	return err
+	var last error
+	for attempt := 0; attempt < 3; attempt++ {
+		status, _, err := c.doWithAllowedStatuses(ctx, session, http.MethodPut, session.Endpoints.Auth+"/verify/trusteddevice/securitycode", session.twoFactorHeaders(), nil, nil, false, http.StatusConflict)
+		if status == http.StatusConflict && err == nil {
+			// 409 表示 Apple 已经为当前 2FA 会话发送过验证码，继续等待用户输入。
+			return nil
+		}
+		if err == nil {
+			return nil
+		}
+		last = err
+		if status < 500 || status > 599 || attempt == 2 {
+			break
+		}
+		delay := time.Duration(attempt+1) * 700 * time.Millisecond
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return last
 }
 
 func (c *AppleAuthClient) requestPhoneSecurityCode(ctx context.Context, session *appleAuthSession, phoneNumber json.RawMessage) error {
@@ -886,44 +925,65 @@ func (c *AppleAuthClient) authWithTokenAndValidate(ctx context.Context, session 
 	if session.SessionToken == "" {
 		return ICloudSession{}, errCode("apple_session_token_missing", "Apple Session Token 缺失，无法换取 iCloud 登录态", true)
 	}
-	var account appleAccountInfo
-	body := map[string]any{
-		"accountCountryCode": session.AccountCountry,
-		"dsWebAuthToken":     session.SessionToken,
-		"extended_login":     true,
-		"trustToken":         session.TrustToken,
-	}
-	headers := session.commonHeaders(map[string]string{})
-	if err := retryAppleTransient(ctx, func() error {
-		_, _, err := c.do(ctx, session, http.MethodPost, session.Endpoints.Setup+"/accountLogin", headers, body, &account, false)
-		return err
-	}); err != nil {
+	account, err := c.accountLogin(ctx, session)
+	if err != nil {
 		return ICloudSession{}, err
 	}
 	cookies := session.cloneCookies()
-	validate, err := NewICloudSessionValidator().Validate(ctx, cookies, session.Endpoints.Host)
-	if err != nil {
-		return ICloudSession{}, err
+	if !hasICloudWebAuthToken(cookies) {
+		// Apple 偶尔会在验证码已验证后的第一次 accountLogin 只返回基础 Cookie；
+		// 浏览器会在同一会话上再次 accountLogin，第二次才下发 Web Token。
+		// 即使首个响应没有解析出 trustToken，也要重试一次并继续保存新 Cookie。
+		account, err = c.accountLogin(ctx, session)
+		if err != nil {
+			return ICloudSession{}, err
+		}
+		cookies = session.cloneCookies()
+	}
+	if !hasICloudWebAuthToken(cookies) {
+		return ICloudSession{}, errCode("icloud_web_cookie_missing", "Apple 验证码已提交，但 iCloud Web 未返回 X-APPLE-WEBAUTH-TOKEN cookie，请重新完成旧接口登录", true)
+	}
+	// accountLogin 成功响应已经包含完整的 dsInfo 和 webservices。
+	// 浏览器在此步骤不会再次调用 /validate；直接使用本次 accountLogin 的响应，
+	// 可以避免额外校验触发 HTTP 421。
+	validatedHost := session.Endpoints.Host
+	mailGatewayURL := account.Webservices["mccgateway"].URL
+	validate := validateResult{
+		AppleID:            firstNonEmpty(account.DSInfo.AppleID, account.DSInfo.PrimaryEmail, session.AppleID),
+		DSID:               account.DSInfo.DSID,
+		ClientID:           session.PortalClientID,
+		ClientBuildNumber:  iCloudPortalBuildNumber,
+		MasteringNumber:    iCloudPortalBuildNumber,
+		PremiumMailBaseURL: account.Webservices["premiummailsettings"].URL,
+		MailGatewayBaseURL: mailGatewayURL,
+		MailBaseURL:        account.Webservices["mail"].URL,
+		IsICloudPlus:       account.DSInfo.IsHideMyEmailSubscriptionActive,
+		CanCreateHME:       account.DSInfo.IsHideMyEmailFeatureAvailable,
+	}
+	mailGatewayURL = validate.MailGatewayBaseURL
+	if strings.Contains(strings.ToLower(mailGatewayURL), ".icloud.com") && !strings.Contains(strings.ToLower(mailGatewayURL), ".icloud.com.cn") && strings.Contains(strings.ToLower(validatedHost), ".icloud.com.cn") {
+		// 登录响应返回国际邮件网关时，后续邮件请求也应切换到国际 iCloud 域名。
+		validatedHost = "www.icloud.com"
 	}
 	savedAt := time.Now()
 	return ICloudSession{
 		SavedAt:            savedAt,
-		AppleID:            firstNonEmpty(validate.AppleID, account.DSInfo.AppleID, account.DSInfo.PrimaryEmail, session.AppleID),
+		AppleID:            validate.AppleID,
 		DSID:               validate.DSID,
 		ClientID:           validate.ClientID,
 		ClientBuildNumber:  validate.ClientBuildNumber,
 		MasteringNumber:    validate.MasteringNumber,
 		PremiumMailBaseURL: strings.TrimRight(validate.PremiumMailBaseURL, "/"),
-		MailGatewayBaseURL: strings.TrimRight(validate.MailGatewayBaseURL, "/"),
+		MailGatewayBaseURL: strings.TrimRight(mailGatewayURL, "/"),
 		MailBaseURL:        strings.TrimRight(validate.MailBaseURL, "/"),
-		Host:               session.Endpoints.Host,
+		Host:               validatedHost,
 		IsICloudPlus:       validate.IsICloudPlus,
 		CanCreateHME:       validate.CanCreateHME,
 		Cookies:            cookies,
 		LoginStates: []LoginState{
 			{
 				Kind:      LoginStateICloudWeb,
-				Host:      session.Endpoints.Host,
+				Host:      validatedHost,
 				Origin:    session.Endpoints.Home,
 				SavedAt:   savedAt,
 				Cookies:   append([]SessionCookie(nil), cookies...),
@@ -933,6 +993,86 @@ func (c *AppleAuthClient) authWithTokenAndValidate(ctx context.Context, session 
 		},
 		Note: "saved from Go Apple SRP protocol login",
 	}, nil
+}
+
+func (c *AppleAuthClient) primeICloudAccountLogin(ctx context.Context, session *appleAuthSession) error {
+	_, err := c.accountLogin(ctx, session)
+	return err
+}
+
+func (c *AppleAuthClient) accountLogin(ctx context.Context, session *appleAuthSession) (appleAccountInfo, error) {
+	var account appleAccountInfo
+	body := map[string]any{
+		"accountCountryCode": session.AccountCountry,
+		"dsWebAuthToken":     session.SessionToken,
+		"extended_login":     true,
+	}
+	if trustToken := strings.TrimSpace(session.TrustToken); trustToken != "" {
+		body["trustToken"] = trustToken
+	}
+	if strings.TrimSpace(session.PortalClientID) == "" {
+		clientID, err := randomUUID()
+		if err != nil {
+			return account, err
+		}
+		session.PortalClientID = clientID
+	}
+	loginURL, err := url.Parse(session.Endpoints.Setup + "/accountLogin")
+	if err != nil {
+		return account, err
+	}
+	requestID, err := randomUUID()
+	if err != nil {
+		return account, err
+	}
+	query := loginURL.Query()
+	query.Set("requestId", requestID)
+	query.Set("clientBuildNumber", iCloudPortalBuildNumber)
+	query.Set("clientMasteringNumber", iCloudPortalBuildNumber)
+	query.Set("clientId", session.PortalClientID)
+	if dsid := firstNonEmpty(strings.TrimSpace(session.DSID), appleDSIDFromCookies(session.Cookies)); dsid != "" {
+		query.Set("dsid", dsid)
+	}
+	loginURL.RawQuery = query.Encode()
+	headers := session.commonHeaders(map[string]string{
+		"Accept":             "*/*",
+		"Content-Type":       "text/plain;charset=UTF-8",
+		"Referer":            strings.TrimSuffix(session.Endpoints.Home, "/") + "/",
+		"User-Agent":         iCloudWebUserAgent,
+		"Cache-Control":      "no-cache",
+		"Pragma":             "no-cache",
+		"Sec-Fetch-Site":     "same-site",
+		"Sec-Fetch-Mode":     "cors",
+		"Sec-Fetch-Dest":     "empty",
+		"Sec-CH-UA-Platform": `"macOS"`,
+		"Sec-CH-UA":          `"Google Chrome";v="153", "Not_A Brand";v="8", "Chromium";v="153"`,
+		"Sec-CH-UA-Mobile":   "?0",
+		"Accept-Language":    "zh-CN,zh;q=0.9",
+	})
+	if err := retryAppleTransient(ctx, func() error {
+		_, _, err := c.do(ctx, session, http.MethodPost, loginURL.String(), headers, body, &account, false)
+		return err
+	}); err != nil {
+		return account, err
+	}
+	session.DSID = firstNonEmpty(account.DSInfo.DSID, session.DSID)
+	return account, nil
+}
+
+func appleDSIDFromCookies(cookies []SessionCookie) string {
+	for _, cookie := range cookies {
+		if !strings.EqualFold(strings.TrimSpace(cookie.Name), "X-APPLE-WEBAUTH-USER") {
+			continue
+		}
+		value := strings.Trim(strings.TrimSpace(cookie.Value), `"`)
+		parts := strings.Split(value, ":")
+		for _, part := range parts {
+			if strings.HasPrefix(strings.ToLower(strings.TrimSpace(part)), "d=") {
+				return strings.TrimSpace(strings.TrimPrefix(part, "d="))
+			}
+		}
+	}
+	return ""
 }
 
 func (c *AppleAuthClient) do(ctx context.Context, session *appleAuthSession, method, rawURL string, headers map[string]string, body any, out any, allow409 bool) (int, []byte, error) {
@@ -1089,6 +1229,12 @@ func isAppleTransientNetworkError(err error) bool {
 
 func (s *appleAuthSession) extract(resp *http.Response) {
 	s.mergeCookies(resp.Request.URL, resp.Cookies())
+	// Apple 的 accountLogin 偶尔返回非标准 Expires 格式；标准库可能会
+	// 忽略整条 Set-Cookie。保留原始响应头做一次轻量兜底，确保 Web Cookie
+	// 能进入待保存的 iCloud 会话。
+	if resp.Request != nil && strings.HasSuffix(resp.Request.URL.Path, "/accountLogin") {
+		mergeRawAccountLoginCookies(&s.Cookies, resp.Request.URL, resp.Header.Values("Set-Cookie"))
+	}
 	if v := resp.Header.Get("X-Apple-ID-Account-Country"); v != "" {
 		s.AccountCountry = v
 	}
@@ -1100,6 +1246,17 @@ func (s *appleAuthSession) extract(resp *http.Response) {
 	}
 	if v := resp.Header.Get("X-Apple-TwoSV-Trust-Token"); v != "" {
 		s.TrustToken = v
+	}
+	if strings.TrimSpace(s.TrustToken) == "" {
+		for _, cookie := range s.Cookies {
+			if !strings.EqualFold(strings.TrimSpace(cookie.Name), "X-APPLE-WEBAUTH-HSA-TRUST") {
+				continue
+			}
+			if value := strings.Trim(strings.TrimSpace(cookie.Value), `"`); value != "" {
+				s.TrustToken = value
+				break
+			}
+		}
 	}
 	if v := resp.Header.Get("scnt"); v != "" {
 		s.Scnt = v
@@ -1114,6 +1271,55 @@ func (s *appleAuthSession) extract(resp *http.Response) {
 	}
 	if v := strings.TrimSpace(resp.Header.Get("X-Apple-HC-Challenge")); v != "" {
 		s.HCChallenge = v
+	}
+}
+
+func mergeRawAccountLoginCookies(cookies *[]SessionCookie, requestURL *url.URL, headers []string) {
+	for _, header := range headers {
+		parts := strings.Split(header, ";")
+		if len(parts) == 0 {
+			continue
+		}
+		pair := strings.TrimSpace(parts[0])
+		nameValue := strings.SplitN(pair, "=", 2)
+		if len(nameValue) != 2 || strings.TrimSpace(nameValue[0]) == "" {
+			continue
+		}
+		cookie := &http.Cookie{
+			Name:  strings.TrimSpace(nameValue[0]),
+			Value: strings.Trim(strings.TrimSpace(nameValue[1]), `"`),
+			Path:  "/",
+		}
+		for _, attribute := range parts[1:] {
+			keyValue := strings.SplitN(strings.TrimSpace(attribute), "=", 2)
+			key := strings.ToLower(strings.TrimSpace(keyValue[0]))
+			value := ""
+			if len(keyValue) == 2 {
+				value = strings.Trim(strings.TrimSpace(keyValue[1]), `"`)
+			}
+			switch key {
+			case "domain":
+				cookie.Domain = value
+			case "path":
+				if value != "" {
+					cookie.Path = value
+				}
+			case "expires":
+				if expires, err := http.ParseTime(value); err == nil {
+					cookie.Expires = expires
+				} else if expires, err := time.Parse("Mon, 2-Jan-2006 15:04:05 MST", value); err == nil {
+					cookie.Expires = expires
+				}
+			case "secure":
+				cookie.Secure = true
+			case "httponly":
+				cookie.HttpOnly = true
+			}
+		}
+		if cookie.Value == "" {
+			continue
+		}
+		mergeSessionCookies(cookies, requestURL, []*http.Cookie{cookie})
 	}
 }
 
@@ -1220,6 +1426,14 @@ func (s *appleAuthSession) srpHeaders() map[string]string {
 		headers["X-Apple-Domain-Id"] = "11"
 		headers["X-Apple-Privacy-Consent"] = "true"
 		headers["X-Apple-Privacy-Consent-Accepted"] = "true"
+	} else {
+		// iCloud 网页旧接口的 2FA 请求会携带网页 App 标识和安全升级标记；
+		// 受信任设备 Mac 弹窗分支缺少这些头时，验证码虽然能提交，后续会话却可能不下发 Web Token。
+		headers["X-Apple-App-Id"] = s.ClientID
+		headers["X-Apple-Domain-Id"] = "3"
+		headers["X-Apple-Privacy-Consent"] = "true"
+		headers["X-Apple-Privacy-Consent-Accepted"] = "true"
+		headers["X-Apple-Offer-Security-Upgrade"] = "1"
 	}
 	return headers
 }

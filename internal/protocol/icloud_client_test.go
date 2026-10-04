@@ -23,6 +23,16 @@ func TestAppleAccountEmptyUnauthorizedResponseIsAuthFailure(t *testing.T) {
 	}
 }
 
+func TestICloudValidate421ErrorDoesNotExposeTrustTokens(t *testing.T) {
+	err := icloudValidateErrorMessage(http.StatusMisdirectedRequest, []byte(`{"success":false,"trustTokens":["fixture-secret"],"error":"Missing X-APPLE-WEBAUTH-TOKEN cookie"}`))
+	if strings.Contains(err, "fixture-secret") {
+		t.Fatalf("421 错误提示不应暴露 trustTokens：%s", err)
+	}
+	if !strings.Contains(err, "Missing X-APPLE-WEBAUTH-TOKEN cookie") {
+		t.Fatalf("421 错误提示缺少可操作原因：%s", err)
+	}
+}
+
 func TestCanonicalMailIDNormalizesMessageIDAcrossReadPaths(t *testing.T) {
 	receivedAt := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
 	fromIMAP := canonicalMailID("<Message-42@Example.COM>", "sender@example.com", "主题", receivedAt)
@@ -81,7 +91,7 @@ func TestMailThreadSearchBodyUsesBrowserFullScanMode(t *testing.T) {
 
 func TestMailThreadSearchBodyKeepsDigestModeForIncrementalSync(t *testing.T) {
 	body := mailThreadSearchBody(mailFolder{Name: "INBOX"}, 20, false)
-	if body["responseType"] != "THREAD_DIGEST" || body["includeFolderStatus"] != false || body["maxResults"] != 20 {
+	if body["responseType"] != "THREAD_DIGEST" || body["includeFolderStatus"] != true || body["maxResults"] != 20 {
 		t.Fatalf("增量 Web 检索请求体不正确：%+v", body)
 	}
 }
@@ -198,7 +208,7 @@ func TestICloudIncrementalSyncKeepsThreadSearchRoute(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Fatalf("解析增量 thread/search 请求失败：%v", err)
 			}
-			if body["responseType"] != "THREAD_DIGEST" || body["includeFolderStatus"] != false {
+			if body["responseType"] != "THREAD_DIGEST" || body["includeFolderStatus"] != true {
 				t.Fatalf("增量 thread/search 请求体不正确：%+v", body)
 			}
 			_, _ = w.Write([]byte(`{"threadList":[{"threadId":"thread-incremental","subject":"登录验证码","preview":"验证码 654321","timestamp":1788105600000}]}`))
@@ -357,9 +367,8 @@ func TestFindRemoteMessageIDsByMailboxIncludesTrash(t *testing.T) {
 				_, _ = w.Write([]byte(`{"domainObjects":[{"identifier":"folder-inbox","name":"INBOX","messageCount":0},{"identifier":"folder-trash","name":"Deleted Messages","messageCount":1}]}`))
 				return
 			}
-			_, _ = w.Write([]byte(`{"domainObjects":[{"identifier":"email-trash","appleThrid":"trash-thread","emailMatchTimestamp":1788105600000}]}`))
 		case "/mailws2/v1/thread/search":
-			t.Fatalf("全量远程扫描不应继续调用 thread/search")
+			_, _ = w.Write([]byte(`{"threadList":[{"threadId":"trash-thread","timestamp":1788105600000}]}`))
 		case "/mailws2/v1/thread/get":
 			_, _ = w.Write([]byte(`{"messageMetadataList":[{"uid":909,"folder":"Deleted Messages","to":[{"email":"code@example.com"}]}]}`))
 		default:
@@ -380,5 +389,62 @@ func TestFindRemoteMessageIDsByMailboxIncludesTrash(t *testing.T) {
 	expected := []string{"icloud:Deleted Messages:909"}
 	if !reflect.DeepEqual(result.RemoteIDsByMailbox["domain-mailbox-1"], expected) {
 		t.Fatalf("废纸篓邮件未按收件人匹配：%+v", result.RemoteIDsByMailbox)
+	}
+}
+
+func TestFindRemoteMessageIDsByMailboxUsesCapturedMessageListRoute(t *testing.T) {
+	var listCalls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/mailws2/v1/geqs/query":
+			_, _ = w.Write([]byte(`{"domainObjects":[{"identifier":"31","name":"INBOX","messageCount":1}]}`))
+		case "/mailws2/v1/thread/search":
+			_, _ = w.Write([]byte(`{"threadList":[{"threadId":"thread-captured","timestamp":1788105600000}]}`))
+		case "/mailws2/v1/message/list":
+			listCalls++
+			if r.URL.Query().Get("clientIntent") != "fetchMessageListByThreadId" {
+				t.Fatalf("message/list 缺少抓包中的 clientIntent：%s", r.URL.RawQuery)
+			}
+			_, _ = w.Write([]byte(`{"domainObjects":[{"uid":77,"identifier":"message-captured","mboxRef":{"id":"31"},"to":"code@example.com","folder":"INBOX"}]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := NewICloudClient()
+	session := ICloudSession{DSID: "fixture-dsid", MailGatewayBaseURL: server.URL, Cookies: []SessionCookie{{Name: "X-APPLE-WEBAUTH-TOKEN", Value: "fixture-token"}}}
+	result, err := client.FindRemoteMessageIDsByMailbox(context.Background(), session, []Mailbox{{ID: "mailbox-1", Email: "code@example.com"}})
+	if err != nil {
+		t.Fatalf("使用抓包邮件列表路由定位邮件失败：%v", err)
+	}
+	if listCalls != 1 || !reflect.DeepEqual(result.RemoteIDsByMailbox["mailbox-1"], []string{"icloud:INBOX:77"}) {
+		t.Fatalf("抓包邮件列表路由结果不正确：calls=%d result=%+v", listCalls, result.RemoteIDsByMailbox)
+	}
+}
+
+func TestMoveRemoteMessagesTreatsDuplicateUpdatedAndNotUpdatedAsSuccess(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/mailws2/v1/geqs/query":
+			_, _ = w.Write([]byte(`{"domainObjects":[{"identifier":"31","name":"INBOX"},{"identifier":"33","name":"Deleted Messages"}]}`))
+		case "/mailws2/v1/message/list":
+			_, _ = w.Write([]byte(`{"domainObjects":[{"uid":7,"identifier":"message-7","mboxRef":{"id":"31"}}]}`))
+		case "/mailws2/v1/email/set":
+			w.WriteHeader(http.StatusMultiStatus)
+			_, _ = w.Write([]byte(`{"updated":{"message-7":{}},"notUpdated":{"message-7":{"type":"unknown"}}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := NewICloudClient()
+	session := ICloudSession{DSID: "fixture-dsid", MailGatewayBaseURL: server.URL, Cookies: []SessionCookie{{Name: "X-APPLE-WEBAUTH-TOKEN", Value: "fixture-token"}}}
+	result, err := client.MoveRemoteMessagesToTrash(context.Background(), session, []string{"icloud:INBOX:7"})
+	if err != nil || result.MovedToTrash != 1 {
+		t.Fatalf("207 同时返回 updated/notUpdated 时应按已更新处理：result=%+v err=%v", result, err)
 	}
 }

@@ -3038,7 +3038,7 @@ textarea.field {
 }
 
 .card-select-menu {
-  @apply absolute left-0 top-[calc(100%+0.375rem)] z-50 max-h-64 w-full min-w-full space-y-1 overflow-y-auto border bg-white p-1.5 shadow-xl dark:bg-slate-900;
+  @apply fixed z-[80] max-h-64 space-y-1 overflow-y-auto border bg-white p-1.5 shadow-xl dark:bg-slate-900;
   border-color: var(--app-line);
   border-radius: 11px;
 }

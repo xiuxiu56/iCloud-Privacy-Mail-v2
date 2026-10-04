@@ -340,7 +340,7 @@ func (c *ICloudClient) createPrivacyMailboxWithAppleAccountState(ctx context.Con
 		AnonymousID: strings.TrimSpace(completed.ID),
 		Email:       strings.ToLower(strings.TrimSpace(firstNonEmpty(completed.EmailAddress, generated.EmailAddress))),
 		Label:       strings.TrimSpace(firstNonEmpty(completed.Label, label)),
-		Note:        strings.TrimSpace(firstNonEmpty(completed.Note, note, "created by Apple Account private email API")),
+		Note:        strings.TrimSpace(firstNonEmpty(completed.Note, note)),
 		IsActive:    completed.Active,
 		Origin:      "APPLE_ACCOUNT",
 	}
@@ -1515,11 +1515,11 @@ func (c *ICloudClient) FindRemoteMessageIDsByMailbox(ctx context.Context, sessio
 	seenThreads := make(map[string]bool)
 	for _, folder := range folders {
 		const maxThreads = 1000
-		threads, hasMore, err := c.searchThreadsFromGEQS(ctx, session, folder, maxThreads)
+		threads, err := c.searchThreadsWithOptions(ctx, session, folder, maxThreads, true)
 		if err != nil {
 			return result, err
 		}
-		if hasMore {
+		if len(threads) >= maxThreads {
 			return result, errCode("icloud_remote_scan_incomplete", "iCloud 云端单个文件夹返回了 1000 个邮件线程，为避免遗漏邮件，本次未继续删除", true)
 		}
 		for _, thread := range threads {
@@ -1624,7 +1624,7 @@ func (c *ICloudClient) mailFolders(ctx context.Context, session ICloudSession) (
 	}
 	body := map[string]any{
 		"domain":        "mailbox",
-		"includeLabels": true,
+		"includeLabels": false,
 		"predicate": map[string]any{
 			"type": "eq",
 			"expression": map[string]any{
@@ -1633,7 +1633,7 @@ func (c *ICloudClient) mailFolders(ctx context.Context, session ICloudSession) (
 			},
 			"value": false,
 		},
-		"properties": []string{"identifier", "name", "uidValidity", "unseenCount", "seenDeletedCount", "unseenDeletedCount", "messageCount", "flags"},
+		"properties": []string{"identifier", "name", "uidValidity", "unseenCount", "seenDeletedCount", "unseenDeletedCount", "messageCount"},
 	}
 	if err := c.callMail(ctx, session, "/mailws2/v1/geqs/query", body, "fetchMailboxCountQuery", &out); err != nil {
 		return nil, err
@@ -1700,79 +1700,9 @@ func (c *ICloudClient) searchThreadsWithOptions(ctx context.Context, session ICl
 	return threads, nil
 }
 
-// 全量同步使用网页端的邮件查询接口及延续标记，避免只处理首批 1000 条线程。
-func (c *ICloudClient) searchThreadsFromGEQS(ctx context.Context, session ICloudSession, folder mailFolder, limit int) ([]mailThread, bool, error) {
-	if strings.TrimSpace(folder.ID) == "" {
-		return nil, false, errCode("icloud_mail_folder_id_missing", "iCloud 邮件夹缺少 identifier，无法执行全量补查", true)
-	}
-	if limit <= 0 || limit > 1000 {
-		limit = 1000
-	}
-	var threads []mailThread
-	marker := ""
-	seenMarkers := make(map[string]bool)
-	for page := 0; page < 100; page++ {
-		var out struct {
-			DomainObjects []struct {
-				Identifier          string          `json:"identifier"`
-				AppleThrid          string          `json:"appleThrid"`
-				ThreadID            string          `json:"threadId"`
-				EmailMatchTimestamp json.RawMessage `json:"emailMatchTimestamp"`
-			} `json:"domainObjects"`
-			ContinuationMarker string `json:"continuationMarker"`
-		}
-		body := mailGEQSFullScanBody(folder.ID, limit, marker)
-		if err := c.callMail(ctx, session, "/mailws2/v1/geqs/query", body, "fetchCategoryView", &out); err != nil {
-			return threads, true, err
-		}
-		for _, item := range out.DomainObjects {
-			threadID := firstNonEmpty(item.AppleThrid, item.ThreadID, item.Identifier)
-			if threadID = strings.TrimSpace(threadID); threadID != "" {
-				threads = append(threads, mailThread{ThreadID: threadID, ReceivedAt: parseMailTime(item.EmailMatchTimestamp)})
-			}
-		}
-		next := strings.TrimSpace(out.ContinuationMarker)
-		if next == "" {
-			// GEQS 用 continuationMarker 明确表示是否还有下一页；最后一页恰好填满 limit 时也不再猜测。
-			return threads, false, nil
-		}
-		if seenMarkers[next] {
-			return threads, true, errCode("icloud_mail_pagination_loop", "iCloud 邮件查询重复返回相同分页标记", true)
-		}
-		seenMarkers[next] = true
-		marker = next
-	}
-	return threads, true, errCode("icloud_mail_page_limit", "iCloud 邮件查询超过 100 页，请缩小同步范围后重试", true)
-}
-
-func mailGEQSFullScanBody(folderID string, limit int, marker string) map[string]any {
-	body := map[string]any{
-		"domain":     "email",
-		"properties": []string{"identifier", "emailMatchTimestamp"},
-		"limit":      limit,
-		"predicate": map[string]any{
-			"type":       "eq",
-			"expression": map[string]any{"type": "fieldOf", "property": "flags", "value": "DELETED"},
-			"value":      false,
-			"and": []any{map[string]any{
-				"type":       "mapHasKeyIn",
-				"expression": map[string]any{"property": "mboxRefUidMap"},
-				"value":      []string{folderID},
-			}},
-		},
-		"collapseOn":  "appleThrid",
-		"orderby":     map[string]any{"expressions": []any{map[string]any{"property": "stateInternalDate", "type": "property"}}, "ascending": false},
-		"strictLimit": false,
-	}
-	if marker != "" {
-		body["continuationMarker"] = marker
-	}
-	return body
-}
-
 func mailThreadSearchBody(folder mailFolder, maxThreads int, fullScan bool) map[string]any {
 	responseType := "THREAD_DIGEST"
-	includeFolderStatus := false
+	includeFolderStatus := true
 	if fullScan {
 		// 与 iCloud 网页端的大批量线程检索请求保持一致。
 		responseType = "THREAD_ID_AND_DATE"
@@ -1800,25 +1730,12 @@ func (c *ICloudClient) threadMessagesForAliases(ctx context.Context, session ICl
 }
 
 func (c *ICloudClient) threadRemoteMessageIDsByMailbox(ctx context.Context, session ICloudSession, folder mailFolder, threadID string, aliases map[string]string) (map[string][]string, error) {
-	var out struct {
-		MessageMetadataList []struct {
-			UID        json.RawMessage `json:"uid"`
-			Folder     string          `json:"folder"`
-			To         json.RawMessage `json:"to"`
-			CC         json.RawMessage `json:"cc"`
-			BCC        json.RawMessage `json:"bcc"`
-			LongHeader string          `json:"longHeader"`
-		} `json:"messageMetadataList"`
-	}
-	body := map[string]any{
-		"threadId":       threadID,
-		"sessionHeaders": mailSessionHeaders(folder.Name, false),
-	}
-	if err := c.callMail(ctx, session, "/mailws2/v1/thread/get", body, "", &out); err != nil {
+	metadata, err := c.listThreadMessages(ctx, session, folder, threadID)
+	if err != nil {
 		return nil, err
 	}
 	matches := make(map[string][]string)
-	for _, meta := range out.MessageMetadataList {
+	for _, meta := range metadata {
 		uid := rawScalarString(meta.UID)
 		if uid == "" {
 			continue
@@ -1833,44 +1750,105 @@ func (c *ICloudClient) threadRemoteMessageIDsByMailbox(ctx context.Context, sess
 	return matches, nil
 }
 
-func (c *ICloudClient) threadMessagesForAliasesWithDiscovery(ctx context.Context, session ICloudSession, folder mailFolder, threadID string, aliases map[string]string, afterByMailbox map[string]time.Time, discoveryDomains []string) (map[string][]ICloudSyncedMessage, map[string][]ICloudSyncedMessage, error) {
-	var out struct {
-		MessageMetadataList []struct {
-			UID        json.RawMessage `json:"uid"`
-			Folder     string          `json:"folder"`
-			MessageID  string          `json:"messageId"`
-			Subject    string          `json:"subject"`
-			Preview    string          `json:"preview"`
-			Date       json.RawMessage `json:"date"`
-			From       json.RawMessage `json:"from"`
-			To         json.RawMessage `json:"to"`
-			CC         json.RawMessage `json:"cc"`
-			BCC        json.RawMessage `json:"bcc"`
-			LongHeader string          `json:"longHeader"`
-			Parts      []struct {
-				PartID      string `json:"partId"`
-				ContentType string `json:"contentType"`
-				IsAttach    bool   `json:"isAttach"`
-				FileName    string `json:"fileName"`
-				Disposition string `json:"disposition"`
-			} `json:"parts"`
-		} `json:"messageMetadataList"`
+type mailThreadPart struct {
+	PartID      string `json:"partId"`
+	ContentType string `json:"contentType"`
+	IsAttach    bool   `json:"isAttach"`
+	FileName    string `json:"fileName"`
+	Disposition string `json:"disposition"`
+}
+
+type mailThreadMessage struct {
+	UID          json.RawMessage `json:"uid"`
+	Folder       string          `json:"folder"`
+	MessageID    string          `json:"messageId"`
+	Subject      string          `json:"subject"`
+	Preview      string          `json:"preview"`
+	Date         json.RawMessage `json:"date"`
+	InternalDate json.RawMessage `json:"stateInternalDate"`
+	From         json.RawMessage `json:"from"`
+	To           json.RawMessage `json:"to"`
+	CC           json.RawMessage `json:"cc"`
+	BCC          json.RawMessage `json:"bcc"`
+	LongHeader   string          `json:"longHeader"`
+	MboxRef      struct {
+		ID string `json:"id"`
+	} `json:"mboxRef"`
+	Parts []mailThreadPart `json:"parts"`
+}
+
+// listThreadMessages 优先使用网页端当前的 message/list 请求；旧服务器仍支持
+// thread/get 时保留回退，避免已有登录态因接口灰度切换而无法同步。
+func (c *ICloudClient) listThreadMessages(ctx context.Context, session ICloudSession, folder mailFolder, threadID string) ([]mailThreadMessage, error) {
+	predicate := map[string]any{
+		"type":       "eq",
+		"expression": map[string]any{"property": "appleThrid"},
+		"value":      threadID,
+		"and": []any{map[string]any{
+			"type":       "eq",
+			"expression": map[string]any{"type": "fieldOf", "property": "flags", "value": "DELETED"},
+			"value":      false,
+		}},
 	}
+	// 网页端按线程查询不会把 mboxRef 限定为当前搜索文件夹，而是返回线程中的全部邮件；
+	// 这样才能覆盖分类文件夹和同一线程跨文件夹的邮件，再由收件地址完成匹配。
 	body := map[string]any{
+		"domain":    "email",
+		"predicate": predicate,
+		"properties": []any{
+			"uid", "appleThrid", "identifier", "flags", "stateInternalDate", "rfc822Size",
+			"hasAttachment", "messageId", "mboxRef", "previewId", "parts", "isSeen", "modseq",
+			map[string]any{"type": "fieldOf", "property": "rfc822HeaderBytes", "value": "From", "alias": "from", "decoder": "encodedWords"},
+			map[string]any{"type": "fieldOf", "property": "rfc822HeaderBytes", "value": "To", "alias": "to", "decoder": "encodedWords"},
+			map[string]any{"type": "fieldOf", "property": "rfc822HeaderBytes", "value": "Cc", "alias": "cc", "decoder": "encodedWords"},
+			map[string]any{"type": "fieldOf", "property": "rfc822HeaderBytes", "value": "Subject", "alias": "subject", "decoder": "encodedWords"},
+			"properties", "mboxRefUidMap",
+		},
+	}
+	var out struct {
+		DomainObjects []mailThreadMessage `json:"domainObjects"`
+	}
+	listErr := c.callMail(ctx, session, "/mailws2/v1/message/list", body, "fetchMessageListByThreadId", &out)
+	if listErr == nil {
+		for i := range out.DomainObjects {
+			if strings.TrimSpace(out.DomainObjects[i].Folder) == "" {
+				out.DomainObjects[i].Folder = firstNonEmpty(folder.Name, folder.ID)
+			}
+		}
+		return out.DomainObjects, nil
+	}
+
+	var legacy struct {
+		MessageMetadataList []mailThreadMessage `json:"messageMetadataList"`
+	}
+	legacyBody := map[string]any{
 		"threadId":       threadID,
 		"sessionHeaders": mailSessionHeaders(folder.Name, false),
 	}
-	if err := c.callMail(ctx, session, "/mailws2/v1/thread/get", body, "", &out); err != nil {
+	if err := c.callMail(ctx, session, "/mailws2/v1/thread/get", legacyBody, "", &legacy); err != nil {
+		return nil, listErr
+	}
+	for i := range legacy.MessageMetadataList {
+		if strings.TrimSpace(legacy.MessageMetadataList[i].Folder) == "" {
+			legacy.MessageMetadataList[i].Folder = firstNonEmpty(folder.Name, folder.ID)
+		}
+	}
+	return legacy.MessageMetadataList, nil
+}
+
+func (c *ICloudClient) threadMessagesForAliasesWithDiscovery(ctx context.Context, session ICloudSession, folder mailFolder, threadID string, aliases map[string]string, afterByMailbox map[string]time.Time, discoveryDomains []string) (map[string][]ICloudSyncedMessage, map[string][]ICloudSyncedMessage, error) {
+	metadata, err := c.listThreadMessages(ctx, session, folder, threadID)
+	if err != nil {
 		return nil, nil, err
 	}
 	messages := make(map[string][]ICloudSyncedMessage)
 	discovered := make(map[string][]ICloudSyncedMessage)
-	for _, meta := range out.MessageMetadataList {
+	for _, meta := range metadata {
 		uid := rawScalarString(meta.UID)
 		if uid == "" {
 			continue
 		}
-		receivedAt := firstNonZeroTime(parseMailTime(meta.Date), time.Now())
+		receivedAt := firstNonZeroTime(parseMailTime(meta.Date), parseMailTime(meta.InternalDate), time.Now())
 		folderName := firstNonEmpty(cleanMailFolder(meta.Folder), folder.Name)
 		from := addressSummary(meta.From)
 		recipients := webMessageRecipientText(string(meta.To), string(meta.CC), string(meta.BCC), mailHeaderRecipients(meta.LongHeader))
@@ -2141,11 +2119,11 @@ func (c *ICloudClient) moveRemoteMessagesToTrash(ctx context.Context, session IC
 		for _, uid := range uniqueStrings(imapUIDs) {
 			unresolved[uid] = true
 		}
-		inboxFolders := inboxMailFolders(folders)
-		if len(inboxFolders) == 0 {
-			return result, errCode("icloud_inbox_not_found", "未找到 iCloud 收件箱文件夹", true)
+		resolveFolders := preferredMailFolders(folders)
+		if len(resolveFolders) == 0 {
+			return result, errCode("icloud_mail_folder_not_found", "未找到可定位 IMAP 邮件的 iCloud 文件夹", true)
 		}
-		for _, folder := range inboxFolders {
+		for _, folder := range resolveFolders {
 			if len(unresolved) == 0 {
 				break
 			}
@@ -2492,8 +2470,17 @@ func (c *ICloudClient) moveMailIdentifiersToTrash(ctx context.Context, session I
 		if err := c.callMail(ctx, session, "/mailws2/v1/email/set", body, iCloudMailDeleteClientIntent, &resp); err != nil {
 			return moved, err
 		}
-		if len(resp.NotUpdated) > 0 {
-			return moved + len(resp.Updated), fmt.Errorf("iCloud 邮件移入废纸篓失败数量：%d", len(resp.NotUpdated))
+		// Apple 的 207 响应可能同时把同一标识放进 updated 和 notUpdated。
+		// 后续邮箱查询会确认这类邮件已经移入废纸篓，因此以 updated 为准，
+		// 只有没有出现在 updated 中的 notUpdated 才算真正失败。
+		failed := 0
+		for id := range resp.NotUpdated {
+			if _, updated := resp.Updated[id]; !updated {
+				failed++
+			}
+		}
+		if failed > 0 {
+			return moved + len(resp.Updated), fmt.Errorf("iCloud 邮件移入废纸篓失败数量：%d", failed)
 		}
 		if len(resp.Updated) > 0 {
 			moved += len(resp.Updated)
@@ -2519,8 +2506,18 @@ func (c *ICloudClient) destroyMailIdentifiers(ctx context.Context, session IClou
 		if err := c.callMail(ctx, session, "/mailws2/v1/email/set", body, iCloudMailDeleteClientIntent, &resp); err != nil {
 			return destroyed, err
 		}
-		if len(resp.NotDestroyed) > 0 {
-			return destroyed + len(resp.Destroyed), fmt.Errorf("iCloud 邮件彻底清除失败数量：%d", len(resp.NotDestroyed))
+		destroyedIDs := make(map[string]bool, len(resp.Destroyed))
+		for _, id := range resp.Destroyed {
+			destroyedIDs[id] = true
+		}
+		failed := 0
+		for id := range resp.NotDestroyed {
+			if !destroyedIDs[id] {
+				failed++
+			}
+		}
+		if failed > 0 {
+			return destroyed + len(resp.Destroyed), fmt.Errorf("iCloud 邮件彻底清除失败数量：%d", failed)
 		}
 		if len(resp.Destroyed) > 0 {
 			destroyed += len(resp.Destroyed)
@@ -2709,10 +2706,10 @@ func (c *ICloudClient) callMailOnce(ctx context.Context, session ICloudSession, 
 	if err != nil {
 		return err
 	}
-	if clientIntent != "" {
-		req.Header.Set("Content-Type", "text/plain;charset=UTF-8")
-	} else {
+	if strings.HasSuffix(path, "/thread/search") || strings.HasSuffix(path, "/message/get") || strings.HasSuffix(path, "/thread/get") {
 		req.Header.Set("Content-Type", "application/json")
+	} else {
+		req.Header.Set("Content-Type", "text/plain;charset=UTF-8")
 	}
 	setICloudFetchHeaders(req, session, "*/*", req.Header.Get("Content-Type"))
 	if cookie := cookieHeader(session.Cookies, u); cookie != "" {
@@ -2823,13 +2820,7 @@ func mailSessionHeaders(folder string, reset bool) map[string]any {
 	return headers
 }
 
-func mailTextParts(parts []struct {
-	PartID      string `json:"partId"`
-	ContentType string `json:"contentType"`
-	IsAttach    bool   `json:"isAttach"`
-	FileName    string `json:"fileName"`
-	Disposition string `json:"disposition"`
-}) []mailTextPart {
+func mailTextParts(parts []mailThreadPart) []mailTextPart {
 	var out []mailTextPart
 	for _, part := range parts {
 		if part.PartID == "" || part.IsAttach || part.FileName != "" {

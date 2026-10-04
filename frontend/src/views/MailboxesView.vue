@@ -32,6 +32,8 @@ const selectedMailboxes = ref([])
 const accounts = ref([])
 const showImport = ref(false)
 const showSync = ref(false)
+const showMessageSync = ref(false)
+const showCleanup = ref(false)
 const showBulkDelete = ref(false)
 const bulkDeleteEmails = ref('')
 const bulkDeleteError = ref('')
@@ -47,7 +49,9 @@ const remoteClean = reactive({ move_synced: true, empty_trash: true })
 const appleMailCleanup = ref({ running: false, status: 'idle', total_accounts: 0, total_mailboxes: 0, completed_mailboxes: 0, successful_mailboxes: 0, failed_mailboxes: 0, queued: 0, active: 0, completed: 0, success: 0, failed: 0 })
 const existingMailboxMessageSync = ref({ running: false, status: 'idle', total_accounts: 0, total_mailboxes: 0, queued: 0, active: 0, completed_accounts: 0, successful_accounts: 0, failed_accounts: 0, imap_accounts: 0, web_api_accounts: 0, fallbacks: 0, scanned: 0, matched: 0, synced_messages: 0 })
 const mailboxImport = reactive({ account_id: '', email: '', label: '', note: '' })
-const syncAccountID = ref('')
+const syncAccountIDs = ref([])
+const messageSyncAccountIDs = ref([])
+const cleanupAccountIDs = ref([])
 const mailboxCommandBar = ref(null)
 const mailboxTableViewport = ref(null)
 const mailboxPagination = ref(null)
@@ -79,6 +83,7 @@ let syncExistingMessagesIntroTimer = null
 let syncExistingMessagesStatusTimer = null
 let syncExistingMessagesIntroVisible = false
 let cleanAllNoticeID = null
+let appleMailCleanupStatusTimer = null
 let mailboxSyncBatch = null
 const mailboxMessageSyncHint = '同步该邮箱所属 Apple 主号的所有新邮件；IMAP 主路径，iCloud Web 补查并自动合并'
 const { success, error: showError, update: updateToast, dismiss: dismissToast } = useToast()
@@ -108,7 +113,7 @@ const accountFilterOptions = computed(() => [
     description: account.label && account.apple_id && account.label !== account.apple_id ? account.apple_id : '只显示此账号创建的邮箱',
   })),
 ])
-const syncAccountOptions = computed(() => [{ value: '', label: '全部 Apple 账号', dot: 'bg-slate-400' }, ...accounts.value.map((account) => ({ value: account.id, label: `${account.label || account.apple_id || account.id}（${account.apple_id}）` }))])
+const syncAccountOptions = computed(() => accounts.value.map((account) => ({ value: account.id, label: `${account.label || account.apple_id || account.id}（${account.apple_id}）` })))
 const hasRowBusyActions = computed(() => Object.keys(rowBusyActions.value).length > 0)
 const codeDialogBusy = computed(() => isBusy('code') || Boolean(codeMailbox.value?.id && rowBusyAction(codeMailbox.value.id) === 'code'))
 const quickEditTitle = computed(() => quickEditField.value === 'note' ? '修改备注' : '修改邮箱状态')
@@ -422,9 +427,17 @@ function applyAppleMailCleanupJob(job, showCompleted = true) {
   const wasRunning = Boolean(appleMailCleanup.value.running)
   appleMailCleanup.value = job
   if (job.running) {
+    // 后台清理只更新进度，不能用列表加载遮罩盖住当前邮箱池。
+    loadingVisible.value = false
     cleanAllNoticeID = updateToast(cleanAllNoticeID, appleMailCleanupText(job), 'info', 0)
+    scheduleAppleMailCleanupStatus()
     return
   }
+  if (appleMailCleanupStatusTimer !== null) {
+    window.clearTimeout(appleMailCleanupStatusTimer)
+    appleMailCleanupStatusTimer = null
+  }
+  if (wasRunning) loadingVisible.value = false
   if (!showCompleted && !wasRunning) return
   if (job.status === 'completed') {
     const completedText = Number(job.discovered || 0) > 0 ? '邮箱池对应的 Apple 云端与本地邮件已清理完成' : '没有已同步的远端邮件，本地邮件已清理完成'
@@ -437,11 +450,20 @@ function applyAppleMailCleanupJob(job, showCompleted = true) {
   if (wasRunning) void load({ silent: true })
 }
 
+function scheduleAppleMailCleanupStatus() {
+  if (appleMailCleanupStatusTimer !== null || !appleMailCleanup.value.running) return
+  appleMailCleanupStatusTimer = window.setTimeout(async () => {
+    appleMailCleanupStatusTimer = null
+    await loadAppleMailCleanupStatus()
+  }, 1000)
+}
+
 async function loadAppleMailCleanupStatus() {
   try {
     const data = await api('/api/apple-mail/cleanup/status')
     applyAppleMailCleanupJob(data.job, false)
   } catch {
+    scheduleAppleMailCleanupStatus()
     return
   }
 }
@@ -469,6 +491,8 @@ function applyExistingMailboxMessageSyncJob(job, showCompleted = true) {
   existingMailboxMessageSync.value = job
   window.clearTimeout(syncExistingMessagesStatusTimer)
   if (job.running) {
+    // 后台同步只更新进度，邮箱池表格保持可见。
+    loadingVisible.value = false
     syncExistingMessagesStatusTimer = window.setTimeout(loadExistingMailboxMessageSyncStatus, 1200)
   }
   if (syncExistingMessagesIntroVisible) return
@@ -487,14 +511,17 @@ function applyExistingMailboxMessageSyncJob(job, showCompleted = true) {
   } else if (job.status === 'interrupted') {
     syncExistingMessagesNoticeID = updateToast(syncExistingMessagesNoticeID, `邮件同步已停止：${job.last_error || '任务未完成'}`, 'warning', 7000)
   }
-  if (wasRunning) void load({ silent: true })
+  if (wasRunning) {
+    loadingVisible.value = false
+    void load({ silent: true })
+  }
 }
 
 function showExistingMailboxMessageSyncIntro() {
   window.clearTimeout(syncExistingMessagesIntroTimer)
   if (syncExistingMessagesIntroID !== null) dismissToast(syncExistingMessagesIntroID)
   syncExistingMessagesIntroVisible = true
-  syncExistingMessagesIntroID = updateToast(null, '正在读取所有 Apple 主号的全部邮件：IMAP 主路径，并使用 iCloud Web 补查缺失邮件……', 'info', 1400)
+  syncExistingMessagesIntroID = updateToast(null, '正在读取所选 Apple 账号的邮件：IMAP 主路径，并使用 iCloud Web 补查缺失邮件……', 'info', 1400)
   syncExistingMessagesIntroTimer = window.setTimeout(() => {
     syncExistingMessagesIntroVisible = false
     syncExistingMessagesIntroID = null
@@ -516,10 +543,38 @@ function openSyncDialog() {
     flash('请先添加 Apple 账号和登录态', true)
     return
   }
-  syncAccountID.value = ''
+  syncAccountIDs.value = []
   showImport.value = false
   showBulkDelete.value = false
+  showMessageSync.value = false
+  showCleanup.value = false
   showSync.value = true
+}
+
+function openMessageSyncDialog() {
+  if (!accounts.value.length) {
+    flash('请先添加 Apple 账号和登录态', true)
+    return
+  }
+  messageSyncAccountIDs.value = []
+  showSync.value = false
+  showImport.value = false
+  showBulkDelete.value = false
+  showCleanup.value = false
+  showMessageSync.value = true
+}
+
+function openCleanupDialog() {
+  if (!accounts.value.length) {
+    flash('请先添加 Apple 账号和登录态', true)
+    return
+  }
+  cleanupAccountIDs.value = []
+  showSync.value = false
+  showImport.value = false
+  showBulkDelete.value = false
+  showMessageSync.value = false
+  showCleanup.value = true
 }
 
 function openImportDialog() {
@@ -643,8 +698,11 @@ function scheduleMailboxTableSize() {
 
 async function load(options = {}) {
   const silent = Boolean(options.silent)
+  const background = silent || deleteQueueRunning || appleMailCleanup.value.running || existingMailboxMessageSync.value.running
+  // 静默刷新不能覆盖正在显示加载遮罩的请求，否则旧请求完成时不会再复位遮罩。
+  if (background && loading.value) return
   const requestID = ++loadRequestID
-  if (!silent) {
+  if (!background) {
     loading.value = true
     loadingVisible.value = false
     clearTimeout(loadingTimer)
@@ -662,9 +720,9 @@ async function load(options = {}) {
     result.value = data
     page.value = result.value.page
   } catch (err) {
-    if (!silent && requestID === loadRequestID) flash(err.message, true)
+    if (!background && requestID === loadRequestID) flash(err.message, true)
   } finally {
-    if (!silent && requestID === loadRequestID) {
+    if (!background && requestID === loadRequestID) {
       clearTimeout(loadingTimer)
       loading.value = false
       loadingVisible.value = false
@@ -675,7 +733,7 @@ async function load(options = {}) {
 }
 
 async function refreshMailboxPool() {
-  if (document.hidden || loading.value || autoRefreshing || deleteQueueRunning || busyActions.value.length || hasRowBusyActions.value) return
+  if (document.hidden || loading.value || autoRefreshing || deleteQueueRunning || appleMailCleanup.value.running || busyActions.value.length || hasRowBusyActions.value) return
   autoRefreshing = true
   try {
     await load({ silent: true })
@@ -793,9 +851,7 @@ async function importMailbox() {
 
 async function syncExistingMailboxes() {
   if (isBusy('sync-existing')) return
-  const targets = syncAccountID.value
-    ? accounts.value.filter((item) => item.id === syncAccountID.value)
-    : accounts.value
+  const targets = accounts.value.filter((item) => syncAccountIDs.value.includes(item.id))
   if (!targets.length) {
     flash('没有可同步的 Apple 账号', true)
     return
@@ -845,10 +901,15 @@ async function syncExistingMailboxes() {
 
 async function syncExistingMailboxMessages() {
   if (isBusy('sync-existing-messages') || isBusy('sync-existing') || existingMailboxMessageSync.value.running) return
+  if (!messageSyncAccountIDs.value.length || messageSyncAccountIDs.value.some((id) => !accounts.value.some((item) => item.id === id))) {
+    flash('请选择 Apple 账号', true)
+    return
+  }
   if (!startBusy('sync-existing-messages')) return
   showExistingMailboxMessageSyncIntro()
   try {
-    const data = await api('/api/mailboxes/sync-messages', { method: 'POST', body: '{}' })
+    const data = await api('/api/mailboxes/sync-messages', { method: 'POST', body: JSON.stringify({ account_ids: messageSyncAccountIDs.value }) })
+    showMessageSync.value = false
     applyExistingMailboxMessageSyncJob(data.job)
   } catch (err) {
     syncExistingMessagesIntroVisible = false
@@ -1096,12 +1157,19 @@ async function cleanRemote() {
 
 async function cleanAllAppleMail() {
   if (isBusy('clean-summary') || isBusy('clean-start') || appleMailCleanup.value.running) return
+  const cleanupAccounts = accounts.value.filter((item) => cleanupAccountIDs.value.includes(item.id))
+  if (!cleanupAccounts.length || cleanupAccounts.length !== cleanupAccountIDs.value.length) {
+    flash('请选择 Apple 账号', true)
+    return
+  }
   startBusy('clean-summary')
   try {
-    const summary = await api('/api/mailboxes?page=1&page_size=1')
+    const summaries = await Promise.all(cleanupAccounts.map((account) => api(`/api/mailboxes?page=1&page_size=1&account_id=${encodeURIComponent(account.id)}`)))
+    const total = summaries.reduce((count, summary) => count + Number(summary.total || 0), 0)
+    const accountNames = cleanupAccounts.map((account) => account.apple_id || account.label || account.id).join('、')
     const confirmed = await confirmAction({
       title: '全部彻底清理 Apple 邮件',
-      message: `清理范围：邮箱池中的 ${summary.total || 0} 个 iCloud 隐私邮箱。将按照单行删除相同的邮件清理规则，只使用列表邮箱已同步保存的远端标识，按 Apple 账号合并后移入废纸篓并彻底清理，成功后删除对应本地邮件；不会扫描收件箱、已发送、草稿、归档等其他文件夹，隐私邮箱地址本身会保留。`,
+      message: `清理范围：${accountNames} 的 ${total} 个 iCloud 隐私邮箱。只使用这些邮箱已同步保存的远端邮件标识，移入废纸篓并彻底清理，成功后删除对应本地邮件；不会扫描其他文件夹，隐私邮箱地址本身会保留。`,
       confirmText: '确认全部清理',
       tone: 'danger',
     })
@@ -1110,8 +1178,9 @@ async function cleanAllAppleMail() {
     startBusy('clean-start')
     const data = await api('/api/apple-mail/cleanup', {
       method: 'POST',
-      body: JSON.stringify({ account_ids: [], scope: 'mailbox_index', strategy: 'move_then_empty_trash', purge_local: true }),
+      body: JSON.stringify({ account_ids: cleanupAccountIDs.value, scope: 'mailbox_index', strategy: 'move_then_empty_trash', purge_local: true }),
     })
+    showCleanup.value = false
     applyAppleMailCleanupJob(data.job)
   } catch (err) {
     if (cleanAllNoticeID !== null) cleanAllNoticeID = updateToast(cleanAllNoticeID, `全部邮件清理失败：${err.message}`, 'error', 7000)
@@ -1158,6 +1227,8 @@ function enqueueMailboxDeletions(mailboxes) {
     accountID: mailbox.account_id || mailbox.accountID || '',
     localOnly: Boolean(mailbox.localOnly),
   })))
+  // 删除队列在后台执行，保留当前邮箱池表格，避免进入永久加载遮罩。
+  loadingVisible.value = false
   updateDeleteProgress()
   processDeleteQueue()
 }
@@ -1299,6 +1370,8 @@ function handlePageKeydown(event) {
   else if (quickEditOpen.value) closeQuickEdit()
   else if (showImport.value) showImport.value = false
   else if (showSync.value) showSync.value = false
+  else if (showMessageSync.value) showMessageSync.value = false
+  else if (showCleanup.value) showCleanup.value = false
   else if (showBulkDelete.value) closeBulkDeleteDialog()
   else if (selected.value) selected.value = null
 }
@@ -1309,8 +1382,8 @@ watch(query, () => {
 })
 watch(accountID, () => { page.value = 1; load() })
 watch(status, () => { page.value = 1; load() })
-watch([selected, codeDialogOpen, quickEditOpen, showImport, showSync, showBulkDelete], ([mailbox, codeOpen, quickEditOpenValue, importOpen, syncOpen, bulkDeleteOpen]) => {
-  document.body.style.overflow = mailbox || codeOpen || quickEditOpenValue || importOpen || syncOpen || bulkDeleteOpen ? 'hidden' : ''
+watch([selected, codeDialogOpen, quickEditOpen, showImport, showSync, showMessageSync, showCleanup, showBulkDelete], ([mailbox, codeOpen, quickEditOpenValue, importOpen, syncOpen, messageSyncOpen, cleanupOpen, bulkDeleteOpen]) => {
+  document.body.style.overflow = mailbox || codeOpen || quickEditOpenValue || importOpen || syncOpen || messageSyncOpen || cleanupOpen || bulkDeleteOpen ? 'hidden' : ''
 })
 watch(selected, (value) => {
   if (!value) selectedMessage.value = null
@@ -1335,6 +1408,7 @@ onBeforeUnmount(() => {
   clearTimeout(realtimeRefreshTimer)
   clearTimeout(syncExistingMessagesIntroTimer)
   clearTimeout(syncExistingMessagesStatusTimer)
+  if (appleMailCleanupStatusTimer !== null) window.clearTimeout(appleMailCleanupStatusTimer)
   pendingRealtimeResources.clear()
   window.clearInterval(autoRefreshTimer)
   realtimeUnsubscribe()
@@ -1356,9 +1430,9 @@ onBeforeUnmount(() => {
         </div>
         <div class="mailbox-command-actions">
           <button type="button" class="secondary-button mailbox-command-button" :disabled="isBusy('sync-existing') || isBusy('sync-existing-messages') || existingMailboxMessageSync.running" @click="openSyncDialog"><LoaderCircle v-if="isBusy('sync-existing')" :size="14" class="animate-spin" /><CloudDownload v-else :size="14" />{{ isBusy('sync-existing') ? '正在同步邮箱' : '同步已有邮箱' }}</button>
-          <button type="button" class="secondary-button mailbox-command-button" :disabled="isBusy('sync-existing-messages') || isBusy('sync-existing') || existingMailboxMessageSync.running" title="读取所有 Apple 主号的全部邮件；IMAP 主路径，iCloud Web 补查并自动合并" @click="syncExistingMailboxMessages"><LoaderCircle v-if="isBusy('sync-existing-messages') || existingMailboxMessageSync.running" :size="14" class="animate-spin" /><MailOpen v-else :size="14" />{{ existingMailboxMessageSync.running ? `正在同步 ${existingMailboxMessageSync.completed_accounts || 0}/${existingMailboxMessageSync.total_accounts || 0}` : isBusy('sync-existing-messages') ? '正在启动同步' : '同步已有邮箱邮件' }}</button>
+          <button type="button" class="secondary-button mailbox-command-button" :disabled="isBusy('sync-existing-messages') || isBusy('sync-existing') || existingMailboxMessageSync.running" title="选择 Apple 账号后通过 IMAP 同步邮件，并用 iCloud Web 补查" @click="openMessageSyncDialog"><LoaderCircle v-if="isBusy('sync-existing-messages') || existingMailboxMessageSync.running" :size="14" class="animate-spin" /><MailOpen v-else :size="14" />{{ existingMailboxMessageSync.running ? `正在同步 ${existingMailboxMessageSync.completed_accounts || 0}/${existingMailboxMessageSync.total_accounts || 0}` : isBusy('sync-existing-messages') ? '正在启动同步' : '同步已有邮箱邮件' }}</button>
           <button type="button" class="secondary-button mailbox-command-button" :disabled="isBusy('import')" @click="openImportDialog"><LoaderCircle v-if="isBusy('import')" :size="14" class="animate-spin" /><MailPlus v-else :size="14" />{{ isBusy('import') ? '正在导入邮箱' : '导入本地邮箱' }}</button>
-          <button type="button" class="secondary-button mailbox-command-button" :disabled="isBusy('clean-summary') || isBusy('clean-start') || appleMailCleanup.running" title="按邮箱池已同步的远端标识彻底清理 Apple 云端与本地邮件，不扫描其他文件夹" @click="cleanAllAppleMail"><LoaderCircle v-if="isBusy('clean-summary') || isBusy('clean-start') || appleMailCleanup.running" :size="14" class="animate-spin" /><CloudOff v-else :size="14" />{{ isBusy('clean-summary') ? '正在统计邮件' : isBusy('clean-start') ? '正在启动清理' : appleMailCleanup.running ? `正在清理 ${appleMailCleanup.completed_mailboxes || 0}/${appleMailCleanup.total_mailboxes || 0}` : '全部彻底清理 Apple 邮件' }}</button>
+          <button type="button" class="secondary-button mailbox-command-button" :disabled="isBusy('clean-summary') || isBusy('clean-start') || appleMailCleanup.running" title="选择 Apple 账号后按已同步远端标识彻底清理邮件" @click="openCleanupDialog"><LoaderCircle v-if="isBusy('clean-summary') || isBusy('clean-start') || appleMailCleanup.running" :size="14" class="animate-spin" /><CloudOff v-else :size="14" />{{ isBusy('clean-summary') ? '正在统计邮件' : isBusy('clean-start') ? '正在启动清理' : appleMailCleanup.running ? `正在清理 ${appleMailCleanup.completed_mailboxes || 0}/${appleMailCleanup.total_mailboxes || 0}` : '全部彻底清理 Apple 邮件' }}</button>
           <button type="button" class="secondary-button mailbox-command-button mailbox-command-button-danger" :disabled="isBusy('bulk-delete-resolve')" title="按邮箱地址批量彻底删除 Apple 云端和本地邮箱" @click="openBulkDeleteDialog"><Trash2 :size="14" />批量删除指定邮箱</button>
           <button type="button" class="secondary-button mailbox-command-button mailbox-command-button-danger" :disabled="!selectedDeletableCount || deleteConfirmID === 'selected'" :title="selectedDeletableCount ? `彻底删除选中的 ${selectedDeletableCount} 个邮箱` : '请先选择未进入删除队列的邮箱'" @click="removeSelectedMailboxes"><LoaderCircle v-if="deleteConfirmID === 'selected'" :size="14" class="animate-spin" /><Trash2 v-else :size="14" />删除选中{{ selectedDeletableCount ? `（${selectedDeletableCount}）` : '' }}</button>
         </div>
@@ -1412,8 +1486,24 @@ onBeforeUnmount(() => {
       <div v-if="showSync" class="mailbox-dialog-backdrop" role="presentation" @click.self="showSync = false">
         <form class="panel mailbox-operation-dialog mailbox-sync-dialog" role="dialog" aria-modal="true" aria-labelledby="sync-mailboxes-title" @submit.prevent="syncExistingMailboxes">
           <header class="mailbox-dialog-heading"><div><h2 id="sync-mailboxes-title"><CloudDownload :size="18" />同步已有邮箱</h2><p>从所选 Apple 账号读取已有隐私邮箱，并更新到本地邮箱池。</p></div><button type="button" class="icon-button" title="关闭" :disabled="isBusy('sync-existing')" @click="showSync = false"><X :size="16" /></button></header>
-          <div class="mailbox-sync-fields"><div class="form-group"><span class="form-label">同步范围</span><CardSelect v-model="syncAccountID" :options="syncAccountOptions" aria-label="同步范围" /><span class="form-help">同步使用账号已保存的 iCloud Web 旧接口登录态。</span></div></div>
-          <footer class="mailbox-dialog-actions"><button type="button" class="secondary-button" :disabled="isBusy('sync-existing')" @click="showSync = false">取消</button><button class="primary-button" :disabled="isBusy('sync-existing')"><LoaderCircle v-if="isBusy('sync-existing')" :size="15" class="animate-spin" /><CloudDownload v-else :size="15" />{{ isBusy('sync-existing') ? '同步中' : '开始同步' }}</button></footer>
+          <div class="mailbox-sync-fields"><div class="form-group"><span class="form-label">Apple 账号</span><CardSelect v-model="syncAccountIDs" :options="syncAccountOptions" aria-label="同步已有邮箱的 Apple 账号" placeholder="请选择 Apple 账号" multiple /><span class="form-help">可以选择多个账号，分别同步其隐私邮箱地址。</span></div></div>
+          <footer class="mailbox-dialog-actions"><button type="button" class="secondary-button" :disabled="isBusy('sync-existing')" @click="showSync = false">取消</button><button class="primary-button" :disabled="isBusy('sync-existing') || !syncAccountIDs.length"><LoaderCircle v-if="isBusy('sync-existing')" :size="15" class="animate-spin" /><CloudDownload v-else :size="15" />{{ isBusy('sync-existing') ? '同步中' : '开始同步' }}</button></footer>
+        </form>
+      </div>
+
+      <div v-if="showMessageSync" class="mailbox-dialog-backdrop" role="presentation" @click.self="showMessageSync = false">
+        <form class="panel mailbox-operation-dialog mailbox-sync-dialog" role="dialog" aria-modal="true" aria-labelledby="sync-mailbox-messages-title" @submit.prevent="syncExistingMailboxMessages">
+          <header class="mailbox-dialog-heading"><div><h2 id="sync-mailbox-messages-title"><MailOpen :size="18" />同步已有邮箱邮件</h2><p>只同步所选 Apple 账号的邮箱邮件。</p></div><button type="button" class="icon-button" title="关闭" :disabled="isBusy('sync-existing-messages')" @click="showMessageSync = false"><X :size="16" /></button></header>
+          <div class="mailbox-sync-fields"><div class="form-group"><span class="form-label">Apple 账号</span><CardSelect v-model="messageSyncAccountIDs" :options="syncAccountOptions" aria-label="同步邮件的 Apple 账号" placeholder="请选择 Apple 账号" multiple /><span class="form-help">可以选择多个账号；IMAP 为主路径，iCloud Web 用于补查。</span></div></div>
+          <footer class="mailbox-dialog-actions"><button type="button" class="secondary-button" :disabled="isBusy('sync-existing-messages')" @click="showMessageSync = false">取消</button><button class="primary-button" :disabled="isBusy('sync-existing-messages') || !messageSyncAccountIDs.length"><LoaderCircle v-if="isBusy('sync-existing-messages')" :size="15" class="animate-spin" /><MailOpen v-else :size="15" />开始同步</button></footer>
+        </form>
+      </div>
+
+      <div v-if="showCleanup" class="mailbox-dialog-backdrop" role="presentation" @click.self="showCleanup = false">
+        <form class="panel mailbox-operation-dialog mailbox-sync-dialog" role="dialog" aria-modal="true" aria-labelledby="clean-apple-mail-title" @submit.prevent="cleanAllAppleMail">
+          <header class="mailbox-dialog-heading"><div><h2 id="clean-apple-mail-title"><CloudOff :size="18" />全部彻底清理 Apple 邮件</h2><p>仅清理所选 Apple 账号的邮箱池邮件，隐私邮箱地址保留。</p></div><button type="button" class="icon-button" title="关闭" :disabled="isBusy('clean-summary') || isBusy('clean-start')" @click="showCleanup = false"><X :size="16" /></button></header>
+          <div class="mailbox-sync-fields"><div class="form-group"><span class="form-label">Apple 账号</span><CardSelect v-model="cleanupAccountIDs" :options="syncAccountOptions" aria-label="彻底清理邮件的 Apple 账号" placeholder="请选择 Apple 账号" multiple /><span class="form-help">可以选择多个账号，根据本地已同步的远端标识清理云端邮件，再清理本地邮件。</span></div></div>
+          <footer class="mailbox-dialog-actions"><button type="button" class="secondary-button" :disabled="isBusy('clean-summary') || isBusy('clean-start')" @click="showCleanup = false">取消</button><button class="primary-button mailbox-bulk-delete-submit" :disabled="isBusy('clean-summary') || isBusy('clean-start') || !cleanupAccountIDs.length"><LoaderCircle v-if="isBusy('clean-summary') || isBusy('clean-start')" :size="15" class="animate-spin" /><CloudOff v-else :size="15" />继续确认清理</button></footer>
         </form>
       </div>
 

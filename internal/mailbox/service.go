@@ -221,6 +221,19 @@ type existingMailboxMessageSyncTarget struct {
 	mailboxes []domain.Mailbox
 }
 
+func normalizeAccountIDs(values []string) []string {
+	seen := make(map[string]bool, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" && !seen[value] {
+			seen[value] = true
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
 type CodeQuery struct {
 	After         time.Time
 	Keyword       string
@@ -445,6 +458,9 @@ func (s *Service) DeleteCompletely(ctx context.Context, mailboxID string) error 
 	if !ok {
 		return errors.New("对应 Apple 账号登录态不存在")
 	}
+	if !protocol.CanUseICloudWebMail(session) {
+		return errors.New("对应 Apple 账号的 iCloud Web 旧接口登录态不可用，请先完成 iCloud Web 登录")
+	}
 	client := s.deleteClient
 	if client == nil {
 		client = s.client
@@ -494,6 +510,9 @@ func (s *Service) CleanRemoteMessages(ctx context.Context, mailboxID string, opt
 	session, ok := s.store.ICloudSessionByAccountID(mailbox.AccountID)
 	if !ok {
 		return protocol.ICloudMailCleanupResult{}, errors.New("对应 Apple 账号登录态不存在")
+	}
+	if !protocol.CanUseICloudWebMail(session) {
+		return protocol.ICloudMailCleanupResult{}, errors.New("对应 Apple 账号的 iCloud Web 邮件登录态不可用，请先完成 iCloud Web 登录")
 	}
 	options = normalizeRemoteCleanupOptions(options)
 	client := s.deleteClient
@@ -567,69 +586,27 @@ func (s *Service) CleanRemoteMailboxes(ctx context.Context, options RemoteCleanu
 		}
 		if !mailbox.ICloudActive || mailbox.Status == domain.StatusDisabled {
 			result.Cleanup.Skipped++
-			if options.PurgeLocal {
-				removed, err := s.store.DeleteMailboxMessages(mailbox.ID)
-				if err != nil {
-					result.FailedMailboxes++
-					result.Failures = append(result.Failures, RemoteCleanupFailure{MailboxID: mailbox.ID, Email: mailbox.Email, Error: err.Error()})
-				} else {
-					result.Cleanup.LocalRemoved += removed
-				}
-			}
 			continue
 		}
 		session, ok := s.store.ICloudSessionByAccountID(mailbox.AccountID)
-		if !ok {
-			result.Cleanup.Skipped++
-			if options.PurgeLocal {
-				removed, err := s.store.DeleteMailboxMessages(mailbox.ID)
-				if err != nil {
-					result.FailedMailboxes++
-					result.Failures = append(result.Failures, RemoteCleanupFailure{MailboxID: mailbox.ID, Email: mailbox.Email, Error: err.Error()})
-				} else {
-					result.Cleanup.LocalRemoved += removed
-				}
-			}
+		if !ok || !protocol.CanUseICloudWebMail(session) {
+			result.FailedMailboxes++
+			result.Failures = append(result.Failures, RemoteCleanupFailure{MailboxID: mailbox.ID, Email: mailbox.Email, Error: "对应 Apple 账号的 iCloud Web 邮件登录态不可用；本地邮件已保留"})
 			continue
 		}
+		remoteIDs := remoteMessageIDs(s.store.MessagesForMailbox(mailbox.ID))
+		var moved protocol.ICloudMailCleanupResult
 		if options.MoveSynced {
-			moved, err := client.MoveRemoteMessagesToTrash(ctx, session, remoteMessageIDs(s.store.MessagesForMailbox(mailbox.ID)))
+			var err error
+			moved, err = client.MoveRemoteMessagesToTrash(ctx, session, remoteIDs)
 			result.Cleanup.MovedToTrash += moved.MovedToTrash
 			result.Cleanup.Skipped += moved.Skipped
 			if err != nil {
 				result.FailedMailboxes++
 				result.Failures = append(result.Failures, RemoteCleanupFailure{MailboxID: mailbox.ID, Email: mailbox.Email, Error: err.Error()})
-				if options.PurgeLocal {
-					removed, localErr := s.store.DeleteMailboxMessages(mailbox.ID)
-					if localErr == nil {
-						result.Cleanup.LocalRemoved += removed
-					}
-				}
 				continue
 			}
-			var removed int
-			if options.PurgeLocal {
-				removed, err = s.store.DeleteMailboxMessages(mailbox.ID)
-			} else {
-				localIDs := append(append([]string(nil), moved.MovedRemoteIDs...), moved.AbsentRemoteIDs...)
-				removed, err = s.store.DeleteMailboxMessagesByRemoteIDs(mailbox.ID, localIDs)
-			}
-			if err != nil {
-				result.FailedMailboxes++
-				result.Failures = append(result.Failures, RemoteCleanupFailure{MailboxID: mailbox.ID, Email: mailbox.Email, Error: err.Error()})
-				continue
-			}
-			result.Cleanup.LocalRemoved += removed
-		} else if options.PurgeLocal {
-			removed, err := s.store.DeleteMailboxMessages(mailbox.ID)
-			if err != nil {
-				result.FailedMailboxes++
-				result.Failures = append(result.Failures, RemoteCleanupFailure{MailboxID: mailbox.ID, Email: mailbox.Email, Error: err.Error()})
-				continue
-			}
-			result.Cleanup.LocalRemoved += removed
 		}
-		result.Mailboxes++
 		sessionKey := firstNonEmpty(session.AccountID, session.DSID, session.AppleID, mailbox.AccountID)
 		if options.EmptyTrash && !cleanedTrash[sessionKey] {
 			destroyed, err := client.EmptyTrash(ctx, session)
@@ -641,6 +618,28 @@ func (s *Service) CleanRemoteMailboxes(ctx context.Context, options RemoteCleanu
 			}
 			cleanedTrash[sessionKey] = true
 		}
+		if options.MoveSynced {
+			if err := s.store.DeleteMailIndexByRemoteIDs(firstNonEmpty(session.AccountID, mailbox.AccountID), remoteIDs); err != nil {
+				result.FailedMailboxes++
+				result.Failures = append(result.Failures, RemoteCleanupFailure{MailboxID: mailbox.ID, Email: mailbox.Email, Error: err.Error()})
+				continue
+			}
+		}
+		var removed int
+		var err error
+		if options.PurgeLocal {
+			removed, err = s.store.DeleteMailboxMessages(mailbox.ID)
+		} else if options.MoveSynced {
+			confirmedIDs := append(append([]string(nil), moved.MovedRemoteIDs...), moved.AbsentRemoteIDs...)
+			removed, err = s.store.DeleteMailboxMessagesByRemoteIDs(mailbox.ID, confirmedIDs)
+		}
+		if err != nil {
+			result.FailedMailboxes++
+			result.Failures = append(result.Failures, RemoteCleanupFailure{MailboxID: mailbox.ID, Email: mailbox.Email, Error: err.Error()})
+			continue
+		}
+		result.Cleanup.LocalRemoved += removed
+		result.Mailboxes++
 	}
 	return result, nil
 }
@@ -965,6 +964,17 @@ func (s *Service) StartAppleMailCleanup(parent context.Context, request AppleMai
 	if totalMailboxes == 0 {
 		return AppleMailCleanupJob{}, errors.New("邮箱池中没有可清理的 iCloud 隐私邮箱")
 	}
+	webReady := false
+	for _, accountID := range accountIDs {
+		session, ok := s.store.ICloudSessionByAccountID(accountID)
+		if ok && protocol.CanUseICloudWebMail(session) {
+			webReady = true
+			break
+		}
+	}
+	if !webReady {
+		return AppleMailCleanupJob{}, errors.New("对应 Apple 账号的 iCloud Web 邮件登录态不可用，请先完成 iCloud Web 登录")
+	}
 	if parent == nil {
 		parent = context.Background()
 	}
@@ -1045,6 +1055,10 @@ func (s *Service) runAppleMailCleanup(ctx context.Context, request AppleMailClea
 		session, ok := s.store.ICloudSessionByAccountID(accountID)
 		if !ok {
 			s.finishAppleMailCleanupAccount(generation, accountID, account.AppleID, 0, errors.New("该账号没有可用的 iCloud Web 旧接口登录态"))
+			continue
+		}
+		if !protocol.CanUseICloudWebMail(session) {
+			s.finishAppleMailCleanupAccount(generation, accountID, account.AppleID, 0, errors.New("该账号的 iCloud Web 旧接口登录态不可用；请先完成 iCloud Web 登录"))
 			continue
 		}
 		base := s.appleMailCleanupTotals(generation)
@@ -1391,9 +1405,15 @@ func (s *Service) SyncExistingMailboxMessages(ctx context.Context) (ExistingMail
 	return s.syncExistingMailboxMessages(ctx, nil, nil)
 }
 
-// StartExistingMailboxMessageSync 在后台启动全部已有邮箱的邮件同步任务。
-func (s *Service) StartExistingMailboxMessageSync(parent context.Context) (ExistingMailboxMessageSyncJob, error) {
-	targets, totalMailboxes, skippedMailboxes := s.existingMailboxMessageSyncTargets()
+// StartExistingMailboxMessageSync 在后台启动指定 Apple 账号已有邮箱的邮件同步任务。
+func (s *Service) StartExistingMailboxMessageSync(parent context.Context, accountIDs ...string) (ExistingMailboxMessageSyncJob, error) {
+	accountIDs = normalizeAccountIDs(accountIDs)
+	for _, accountID := range accountIDs {
+		if _, ok := s.store.FindAppleAccount(accountID); !ok {
+			return ExistingMailboxMessageSyncJob{}, fmt.Errorf("Apple 账号不存在：%s", accountID)
+		}
+	}
+	targets, totalMailboxes, skippedMailboxes := s.existingMailboxMessageSyncTargets(accountIDs...)
 	if parent == nil {
 		parent = context.Background()
 	}
@@ -1440,7 +1460,11 @@ func (s *Service) runExistingMailboxMessageSync(ctx context.Context, generation 
 	s.finishExistingMailboxMessageSyncJob(generation, result, err)
 }
 
-func (s *Service) existingMailboxMessageSyncTargets() ([]existingMailboxMessageSyncTarget, int, int) {
+func (s *Service) existingMailboxMessageSyncTargets(accountIDs ...string) ([]existingMailboxMessageSyncTarget, int, int) {
+	selected := make(map[string]bool, len(accountIDs))
+	for _, accountID := range accountIDs {
+		selected[accountID] = true
+	}
 	allMailboxes := s.store.AllMailboxes()
 	groups := make(map[string][]domain.Mailbox)
 	order := make([]string, 0)
@@ -1451,6 +1475,9 @@ func (s *Service) existingMailboxMessageSyncTargets() ([]existingMailboxMessageS
 			continue
 		}
 		accountID := s.mailboxSyncGroupKey(mailbox)
+		if len(selected) > 0 && !selected[accountID] {
+			continue
+		}
 		if strings.TrimSpace(mailbox.Email) == "" || accountID == "__legacy__" {
 			skippedMailboxes++
 			continue

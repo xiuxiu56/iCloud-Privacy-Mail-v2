@@ -826,7 +826,25 @@ func (s *Server) handleMailboxSync(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleExistingMailboxMessagesSync(w http.ResponseWriter, r *http.Request) {
-	job, err := s.mailbox.StartExistingMailboxMessageSync(s.runtimeCtx)
+	var body struct {
+		AccountIDs []string `json:"account_ids"`
+		AccountID  string   `json:"account_id"` // 兼容旧客户端
+	}
+	if r.ContentLength != 0 {
+		if err := decodeJSON(r, &body); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+			return
+		}
+	}
+	accountIDs := append([]string(nil), body.AccountIDs...)
+	if strings.TrimSpace(body.AccountID) != "" {
+		accountIDs = append(accountIDs, body.AccountID)
+	}
+	if len(accountIDs) == 0 {
+		writeError(w, http.StatusBadRequest, "account_required", "请选择至少一个 Apple 账号")
+		return
+	}
+	job, err := s.mailbox.StartExistingMailboxMessageSync(s.runtimeCtx, accountIDs...)
 	if err != nil {
 		if strings.Contains(err.Error(), "正在运行") {
 			writeError(w, http.StatusConflict, "mailbox_message_sync_running", err.Error())

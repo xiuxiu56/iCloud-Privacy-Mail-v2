@@ -536,6 +536,39 @@ func TestAppleMailCleanupKeepsLocalMessagesWhenTrashCleanupFails(t *testing.T) {
 	}
 }
 
+func TestAppleMailCleanupRejectsWhenWebSessionUnavailable(t *testing.T) {
+	state, err := store.Open(filepath.Join(t.TempDir(), "app.db"))
+	if err != nil {
+		t.Fatalf("创建临时状态失败：%v", err)
+	}
+	t.Cleanup(func() { _ = state.Close() })
+	session, err := state.SaveICloudSession(domain.ICloudSession{
+		AppleID:            "web-unavailable@icloud.com",
+		DSID:               "web-unavailable-dsid",
+		MailGatewayBaseURL: "https://p1-mccgateway.icloud.com",
+	})
+	if err != nil {
+		t.Fatalf("创建未登录态测试账号失败：%v", err)
+	}
+	if _, _, err := state.UpsertMailboxFromRemote(session.AccountID, domain.RemoteMailbox{
+		AnonymousID: "web-unavailable-mailbox",
+		Email:       "web-unavailable@icloud.com",
+		Label:       "web_unavailable",
+		IsActive:    true,
+	}, "未登录态清理测试"); err != nil {
+		t.Fatalf("创建未登录态测试邮箱失败：%v", err)
+	}
+
+	service := NewService(config.Config{}, state)
+	_, err = service.StartAppleMailCleanup(context.Background(), AppleMailCleanupRequest{AccountIDs: []string{session.AccountID}, PurgeLocal: true})
+	if err == nil || !strings.Contains(err.Error(), "iCloud Web 邮件登录态不可用") {
+		t.Fatalf("未登录态清理应在启动前明确提示：%v", err)
+	}
+	if job := service.AppleMailCleanupStatus(); job.Running || job.Status != "idle" {
+		t.Fatalf("未登录态清理不应创建后台任务：%+v", job)
+	}
+}
+
 func waitAppleMailCleanup(t *testing.T, service *Service, job AppleMailCleanupJob) AppleMailCleanupJob {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
@@ -630,9 +663,10 @@ func newDeleteServiceFixture(t *testing.T) (*store.Store, domain.Mailbox) {
 		t.Fatalf("创建临时状态失败：%v", err)
 	}
 	session, err := state.SaveICloudSession(domain.ICloudSession{
-		AppleID: "delete-fixture@icloud.com",
-		DSID:    "fixture-dsid",
-		Cookies: []domain.SessionCookie{{Name: "X-APPLE-WEBAUTH-TOKEN", Value: "fixture-token"}},
+		AppleID:            "delete-fixture@icloud.com",
+		DSID:               "fixture-dsid",
+		MailGatewayBaseURL: "https://mail.example.test",
+		Cookies:            []domain.SessionCookie{{Name: "X-APPLE-WEBAUTH-TOKEN", Value: "fixture-token"}},
 	})
 	if err != nil {
 		t.Fatalf("创建测试 Apple 登录态失败：%v", err)

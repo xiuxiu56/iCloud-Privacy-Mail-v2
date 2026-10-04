@@ -5,9 +5,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"icloud-privacy-mail-v2/internal/config"
+	"icloud-privacy-mail-v2/internal/domain"
 	mailboxservice "icloud-privacy-mail-v2/internal/mailbox"
 	"icloud-privacy-mail-v2/internal/store"
 )
@@ -18,9 +20,14 @@ func TestHandleExistingMailboxMessagesSyncStartsBackgroundJob(t *testing.T) {
 		t.Fatalf("创建测试数据库失败：%v", err)
 	}
 	defer state.Close()
+	session, err := state.SaveICloudSession(domain.ICloudSession{AppleID: "sync@example.com"})
+	if err != nil {
+		t.Fatalf("保存测试账号失败：%v", err)
+	}
 
 	server := &Server{mailbox: mailboxservice.NewService(config.Default(), state)}
-	request := httptest.NewRequest(http.MethodPost, "/api/mailboxes/sync-messages", nil)
+	request := httptest.NewRequest(http.MethodPost, "/api/mailboxes/sync-messages", strings.NewReader(`{"account_ids":["`+session.AccountID+`"]}`))
+	request.Header.Set("Content-Type", "application/json")
 	recorder := httptest.NewRecorder()
 	server.handleExistingMailboxMessagesSync(recorder, request)
 	if recorder.Code != http.StatusAccepted {

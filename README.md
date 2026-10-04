@@ -283,10 +283,10 @@ GET /api/v1/mailboxes/{email}/messages/{message_id}
 | 邮箱夹列表 | `POST /mailws2/v1/geqs/query?clientIntent=fetchMailboxCountQuery` |
 | 增量线程同步 | `POST /mailws2/v1/thread/search`，请求体使用 `THREAD_DIGEST` |
 | 全量线程同步 | `POST /mailws2/v1/thread/search`，请求体使用 `THREAD_ID_AND_DATE` 和 `includeFolderStatus: true` |
-| 线程邮件元数据 | `POST /mailws2/v1/thread/get` |
+| 线程邮件元数据 | `POST /mailws2/v1/message/list?clientIntent=fetchMessageListByThreadId`，旧会话不支持时回退 `thread/get` |
 | 邮件正文 | `POST /mailws2/v1/message/get` |
 
-邮箱池内容同步的全量和增量流程都使用抓包中的 `thread/search`，再调用 `thread/get` 做收件地址匹配；`fetchCategoryView` 属于网页分类初始化查询，不作为邮箱池内容同步入口。邮件网关请求使用抓包中的 `2634Hotfix39`，门户接口使用 `2634Build50`。Apple 更新网页版本后，应重新抓取并核对构建号、请求体和响应字段。
+邮箱池内容同步的全量和增量流程都使用抓包中的 `thread/search`，再优先调用 `message/list` 做收件地址匹配；旧会话不支持 `message/list` 时才回退 `thread/get`。`fetchCategoryView` 属于网页分类初始化查询，不作为邮箱池内容同步入口。邮件网关请求使用抓包中的 `2634Hotfix39`，门户接口使用抓包中的 `2636Build34`。Apple 更新网页版本后，应重新抓取并核对构建号、请求体和响应字段。
 
 抓包中还出现了 `fetchMailboxQuery`、`fetchRemindMeQuery`、`fetchAccountPref`、`fetchMostRecentMessageTimestamp` 和 `fetchMessageMetadataByThreadIds`。这些是网页初始化、提醒或批量元数据查询，当前收件同步不依赖它们；如果要完全复刻网页行为，还需要对应的响应体来核对字段。
 
